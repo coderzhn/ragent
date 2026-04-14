@@ -44,6 +44,11 @@ public enum ModelProvider {
     SILICON_FLOW("siliconflow"),
 
     /**
+     * 智谱 AI 大模型平台
+     */
+    ZHIPU("zhipu"),
+
+    /**
      * 空实现，用于测试或占位
      */
     NOOP("noop");
