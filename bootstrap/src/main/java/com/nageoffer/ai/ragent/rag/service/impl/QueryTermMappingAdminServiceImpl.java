@@ -17,17 +17,22 @@
 
 package com.nageoffer.ai.ragent.rag.service.impl;
 
+import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.core.lang.Assert;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.mzt.logapi.starter.annotation.LogRecord;
+import com.nageoffer.ai.ragent.audit.constant.BizChangeBizType;
+import com.nageoffer.ai.ragent.audit.constant.BizChangeOperationType;
+import com.nageoffer.ai.ragent.audit.support.BizChangeLogContext;
 import com.nageoffer.ai.ragent.framework.exception.ClientException;
 import com.nageoffer.ai.ragent.rag.controller.request.QueryTermMappingCreateRequest;
 import com.nageoffer.ai.ragent.rag.controller.request.QueryTermMappingPageRequest;
 import com.nageoffer.ai.ragent.rag.controller.request.QueryTermMappingUpdateRequest;
 import com.nageoffer.ai.ragent.rag.controller.vo.QueryTermMappingVO;
-import com.nageoffer.ai.ragent.rag.core.rewrite.QueryTermMappingService;
+import com.nageoffer.ai.ragent.rag.core.rewrite.QueryTermMappingCacheManager;
 import com.nageoffer.ai.ragent.rag.dao.entity.QueryTermMappingDO;
 import com.nageoffer.ai.ragent.rag.dao.mapper.QueryTermMappingMapper;
 import com.nageoffer.ai.ragent.rag.service.QueryTermMappingAdminService;
@@ -39,9 +44,19 @@ import org.springframework.stereotype.Service;
 public class QueryTermMappingAdminServiceImpl implements QueryTermMappingAdminService {
 
     private final QueryTermMappingMapper queryTermMappingMapper;
-    private final QueryTermMappingService queryTermMappingService;
+    private final QueryTermMappingCacheManager queryTermMappingCacheManager;
+    private final BizChangeLogContext bizChangeLogContext;
 
     @Override
+    @LogRecord(
+            success = "创建关键词映射：{{#requestParam.sourceTerm}}",
+            fail = "创建关键词映射失败：{{#_errorMsg}}",
+            type = BizChangeBizType.QUERY_TERM_MAPPING,
+            subType = BizChangeOperationType.CREATE,
+            bizNo = BizChangeLogContext.BIZ_ID_EXPRESSION,
+            extra = BizChangeLogContext.SNAPSHOT_EXPRESSION,
+            condition = BizChangeLogContext.RECORD_CONDITION
+    )
     public String create(QueryTermMappingCreateRequest requestParam) {
         Assert.notNull(requestParam, () -> new ClientException("请求不能为空"));
         String sourceTerm = StrUtil.trimToNull(requestParam.getSourceTerm());
@@ -58,14 +73,25 @@ public class QueryTermMappingAdminServiceImpl implements QueryTermMappingAdminSe
         record.setRemark(StrUtil.trimToNull(requestParam.getRemark()));
 
         queryTermMappingMapper.insert(record);
-        queryTermMappingService.loadMappings();
+        queryTermMappingCacheManager.clearCache();
+        bizChangeLogContext.put(String.valueOf(record.getId()), null, record);
         return String.valueOf(record.getId());
     }
 
     @Override
+    @LogRecord(
+            success = "更新关键词映射：{{#id}}",
+            fail = "更新关键词映射失败：{{#_errorMsg}}",
+            type = BizChangeBizType.QUERY_TERM_MAPPING,
+            subType = BizChangeOperationType.UPDATE,
+            bizNo = "{{#id}}",
+            extra = BizChangeLogContext.SNAPSHOT_EXPRESSION,
+            condition = BizChangeLogContext.RECORD_CONDITION
+    )
     public void update(String id, QueryTermMappingUpdateRequest requestParam) {
         Assert.notNull(requestParam, () -> new ClientException("请求不能为空"));
         QueryTermMappingDO record = loadById(id);
+        QueryTermMappingDO before = BeanUtil.copyProperties(record, QueryTermMappingDO.class);
 
         if (requestParam.getSourceTerm() != null) {
             String sourceTerm = StrUtil.trimToNull(requestParam.getSourceTerm());
@@ -91,14 +117,26 @@ public class QueryTermMappingAdminServiceImpl implements QueryTermMappingAdminSe
         }
 
         queryTermMappingMapper.updateById(record);
-        queryTermMappingService.loadMappings();
+        queryTermMappingCacheManager.clearCache();
+        bizChangeLogContext.put(id, before, queryTermMappingMapper.selectById(id));
     }
 
     @Override
+    @LogRecord(
+            success = "删除关键词映射：{{#id}}",
+            fail = "删除关键词映射失败：{{#_errorMsg}}",
+            type = BizChangeBizType.QUERY_TERM_MAPPING,
+            subType = BizChangeOperationType.DELETE,
+            bizNo = "{{#id}}",
+            extra = BizChangeLogContext.SNAPSHOT_EXPRESSION,
+            condition = BizChangeLogContext.RECORD_CONDITION
+    )
     public void delete(String id) {
         QueryTermMappingDO record = loadById(id);
+        QueryTermMappingDO before = BeanUtil.copyProperties(record, QueryTermMappingDO.class);
         queryTermMappingMapper.deleteById(record.getId());
-        queryTermMappingService.loadMappings();
+        queryTermMappingCacheManager.clearCache();
+        bizChangeLogContext.put(id, before, null);
     }
 
     @Override

@@ -17,54 +17,36 @@
 
 package com.nageoffer.ai.ragent.core.parser;
 
-import java.io.InputStream;
+import com.nageoffer.ai.ragent.core.parser.model.ParsedDocument;
+import com.nageoffer.ai.ragent.core.parser.registry.ParseProfile;
+
 import java.util.Map;
+import java.util.Set;
 
 /**
- * 文档解析器统一接口
+ * 文档解析器统一接口：核心是 {@link #parseStructured}，产出含 Block 列表的 {@link ParsedDocument}
  * <p>
- * 提供文档解析的通用能力，支持多种文档格式（PDF、Word、Markdown 等）
- * 可用于知识库导入、RAG 检索等场景
+ * 解析器通过 {@link #supportedMimeTypes()} 显式认领 (MIME × 档位)，由 {@code ParserRegistry}
+ * 在启动期建表，键冲突即启动失败
  */
 public interface DocumentParser {
 
     /**
-     * 获取解析器类型标识
-     *
-     * @return 解析器类型（如 {@link ParserType#TIKA}、{@link ParserType#MARKDOWN}）
+     * 解析器类型标识，取值见 {@link ParserType}
      */
     String getParserType();
 
     /**
-     * 解析文档内容（从字节数组）
-     *
-     * @param content  文档的二进制字节数组
-     * @param mimeType 文档的 MIME 类型（可选）
-     * @param options  解析选项（可选）
-     * @return 解析结果
+     * 结构化解析：产出有序的 Block 列表（章节、段落、表格、图片等），mimeType 与 options 可为空
      */
-    default ParseResult parse(byte[] content, String mimeType, Map<String, Object> options) {
-        throw new UnsupportedOperationException("parse(byte[], String, Map) not implemented");
-    }
+    ParsedDocument parseStructured(byte[] content, String mimeType, Map<String, Object> options);
 
     /**
-     * 解析文档内容（从输入流）
-     *
-     * @param stream   文档输入流
-     * @param fileName 文件名（用于推断类型）
-     * @return 解析后的文本内容
+     * 认领清单：档位 → 该档位下认领的 MIME 集合，不得为空
+     * <p>
+     * MIME 一律小写；支持 {@code type/*} 通配，精确键优先于通配键；未在请求档位注册时回落到全局
+     * 兜底档 {@link ParseProfile#FAST}，故只在该档位有专属解析器时才需声明，如 Excel 的 FAST 档
+     * 走 POI 快速 key-val、FIDELITY 档才交给 MinerU 做版面解析
      */
-    default String extractText(InputStream stream, String fileName) {
-        throw new UnsupportedOperationException("extractText(InputStream, String) not implemented");
-    }
-
-    /**
-     * 检查是否支持指定的 MIME 类型
-     *
-     * @param mimeType MIME 类型
-     * @return 是否支持
-     */
-    default boolean supports(String mimeType) {
-        return true;
-    }
+    Map<ParseProfile, Set<String>> supportedMimeTypes();
 }

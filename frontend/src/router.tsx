@@ -2,12 +2,16 @@ import { Navigate, createBrowserRouter } from "react-router-dom";
 
 import { LoginPage } from "@/pages/LoginPage";
 import { ChatPage } from "@/pages/ChatPage";
+import { ChangeLogsPage } from "@/pages/ChangeLogsPage";
+import { DocPreviewPage } from "@/pages/DocPreviewPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { AdminLayout } from "@/pages/admin/AdminLayout";
 import { DashboardPage } from "@/pages/admin/dashboard/DashboardPage";
 import { KnowledgeListPage } from "@/pages/admin/knowledge/KnowledgeListPage";
 import { KnowledgeDocumentsPage } from "@/pages/admin/knowledge/KnowledgeDocumentsPage";
 import { KnowledgeChunksPage } from "@/pages/admin/knowledge/KnowledgeChunksPage";
+import { KnowledgeGraphPage } from "@/pages/admin/knowledge-graph/KnowledgeGraphPage";
+import { BizChangeLogPage } from "@/pages/admin/change-logs/BizChangeLogPage";
 import { IntentTreePage } from "@/pages/admin/intent-tree/IntentTreePage";
 import { IntentListPage } from "@/pages/admin/intent-tree/IntentListPage";
 import { IntentEditPage } from "@/pages/admin/intent-tree/IntentEditPage";
@@ -17,6 +21,8 @@ import { RagTraceDetailPage } from "@/pages/admin/traces/RagTraceDetailPage";
 import { SystemSettingsPage } from "@/pages/admin/settings/SystemSettingsPage";
 import { SampleQuestionPage } from "@/pages/admin/sample-questions/SampleQuestionPage";
 import { QueryTermMappingPage } from "@/pages/admin/query-term-mapping/QueryTermMappingPage";
+import { AgentProfilePage } from "@/pages/admin/agents/AgentProfilePage";
+import { AgentPromptPage } from "@/pages/admin/agents/AgentPromptPage";
 import { UserListPage } from "@/pages/admin/users/UserListPage";
 import { useAuthStore } from "@/stores/authStore";
 
@@ -86,6 +92,22 @@ export const router = createBrowserRouter([
     )
   },
   {
+    path: "/change-logs",
+    element: (
+      <RequireAuth>
+        <ChangeLogsPage />
+      </RequireAuth>
+    )
+  },
+  {
+    path: "/preview/doc/:docId",
+    element: (
+      <RequireAuth>
+        <DocPreviewPage />
+      </RequireAuth>
+    )
+  },
+  {
     path: "/admin",
     element: (
       <RequireAdmin>
@@ -114,6 +136,10 @@ export const router = createBrowserRouter([
         element: <KnowledgeChunksPage />
       },
       {
+        path: "knowledge-graph",
+        element: <KnowledgeGraphPage />
+      },
+      {
         path: "intent-tree",
         element: <IntentTreePage />
       },
@@ -138,6 +164,10 @@ export const router = createBrowserRouter([
         element: <RagTraceDetailPage />
       },
       {
+        path: "change-logs",
+        element: <BizChangeLogPage />
+      },
+      {
         path: "settings",
         element: <SystemSettingsPage />
       },
@@ -148,6 +178,14 @@ export const router = createBrowserRouter([
       {
         path: "mappings",
         element: <QueryTermMappingPage />
+      },
+      {
+        path: "agents",
+        element: <AgentProfilePage />
+      },
+      {
+        path: "agents/:agentId",
+        element: <AgentPromptPage />
       },
       {
         path: "users",

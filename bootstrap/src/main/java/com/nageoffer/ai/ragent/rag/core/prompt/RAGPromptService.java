@@ -20,7 +20,7 @@ package com.nageoffer.ai.ragent.rag.core.prompt;
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
 import com.nageoffer.ai.ragent.framework.convention.ChatMessage;
-import com.nageoffer.ai.ragent.framework.convention.RetrievedChunk;
+import com.nageoffer.ai.ragent.rag.config.RAGConfigProperties;
 import com.nageoffer.ai.ragent.rag.core.intent.IntentNode;
 import com.nageoffer.ai.ragent.rag.core.intent.NodeScore;
 import lombok.RequiredArgsConstructor;
@@ -28,12 +28,15 @@ import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
-import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.MCP_KB_MIXED_PROMPT_PATH;
-import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.MCP_ONLY_PROMPT_PATH;
-import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.RAG_ENTERPRISE_PROMPT_PATH;
+import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.ANSWER_CITATION_RULES_PROMPT_PATH;
+import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.CONTEXT_FORMAT_PATH;
 
 /**
  * RAG Prompt 编排服务
@@ -44,10 +47,9 @@ import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.RAG_ENTERPRISE_PR
 @RequiredArgsConstructor
 public class RAGPromptService {
 
-    private static final String MCP_CONTEXT_HEADER = "## 动态数据片段";
-    private static final String KB_CONTEXT_HEADER = "## 文档内容";
-
-    private final PromptTemplateLoader promptTemplateLoader;
+    private final PromptTemplateLoader templateLoader;
+    private final AgentPromptResolver agentPromptResolver;
+    private final RAGConfigProperties ragConfigProperties;
 
     /**
      * 生成系统提示词，并对模板格式做清理
@@ -57,7 +59,20 @@ public class RAGPromptService {
         String template = StrUtil.isNotBlank(plan.getBaseTemplate())
                 ? plan.getBaseTemplate()
                 : defaultTemplate(plan.getScene());
-        return StrUtil.isBlank(template) ? "" : PromptTemplateUtils.cleanupPrompt(template);
+        String systemPrompt = StrUtil.isBlank(template) ? "" : PromptTemplateUtils.cleanupPrompt(template);
+        if (!context.hasKb() || !Boolean.TRUE.equals(ragConfigProperties.getCitationEnabled())) {
+            return systemPrompt;
+        }
+
+        String citationRules = PromptTemplateUtils.cleanupPrompt(
+                templateLoader.load(ANSWER_CITATION_RULES_PROMPT_PATH));
+        if (StrUtil.isBlank(systemPrompt)) {
+            return citationRules;
+        }
+        if (StrUtil.isBlank(citationRules)) {
+            return systemPrompt;
+        }
+        return systemPrompt + "\n\n" + citationRules;
     }
 
     /**
@@ -68,69 +83,56 @@ public class RAGPromptService {
                                                      String question,
                                                      List<String> subQuestions) {
         List<ChatMessage> messages = new ArrayList<>();
+
+        // 1. 系统提示词
         String systemPrompt = buildSystemPrompt(context);
         if (StrUtil.isNotBlank(systemPrompt)) {
             messages.add(ChatMessage.system(systemPrompt));
         }
-        if (StrUtil.isNotBlank(context.getMcpContext())) {
-            messages.add(ChatMessage.system(formatEvidence(MCP_CONTEXT_HEADER, context.getMcpContext())));
-        }
-        if (StrUtil.isNotBlank(context.getKbContext())) {
-            messages.add(ChatMessage.user(formatEvidence(KB_CONTEXT_HEADER, context.getKbContext())));
-        }
+
+        // 2. 对话历史（含摘要，摘要作为 history[0] 的 system message 自然紧跟系统提示词）
         if (CollUtil.isNotEmpty(history)) {
             messages.addAll(history);
         }
 
-        // 多子问题场景下，显式编号以降低模型漏答风险
-        if (CollUtil.isNotEmpty(subQuestions) && subQuestions.size() > 1) {
-            StringBuilder userMessage = new StringBuilder();
-            userMessage.append("请基于上述文档内容，回答以下问题：\n\n");
-            for (int i = 0; i < subQuestions.size(); i++) {
-                userMessage.append(i + 1).append(". ").append(subQuestions.get(i)).append("\n");
-            }
-            messages.add(ChatMessage.user(userMessage.toString().trim()));
-        } else if (StrUtil.isNotBlank(question)) {
-            messages.add(ChatMessage.user(question));
+        // 3. 证据 + 问题（合并为一条 user message）
+        String evidenceBody = buildEvidenceBody(context);
+        String userQuestion = buildUserQuestion(question, subQuestions);
+        String userContent = mergeEvidenceAndQuestion(evidenceBody, userQuestion);
+        if (StrUtil.isNotBlank(userContent)) {
+            messages.add(ChatMessage.user(userContent));
         }
 
         return messages;
     }
 
-    private PromptPlan planPrompt(List<NodeScore> intents, Map<String, List<RetrievedChunk>> intentChunks) {
+    private PromptPlan planPrompt(List<NodeScore> intents, Set<String> eligibleIntentIds) {
         List<NodeScore> safeIntents = intents == null ? Collections.emptyList() : intents;
+        Map<String, NodeScore> eligibleById = new LinkedHashMap<>();
+        for (NodeScore intent : safeIntents) {
+            if (intent == null || intent.getNode() == null) {
+                continue;
+            }
+            String intentId = intent.getNode().getId();
+            if (!eligibleIntentIds.contains(intentId)) {
+                continue;
+            }
+            eligibleById.putIfAbsent(intentId, intent);
+        }
+        List<NodeScore> eligibleIntents = new ArrayList<>(eligibleById.values());
 
-        // 1) 先剔除“未命中检索”的意图
-        List<NodeScore> retained = safeIntents.stream()
-                .filter(ns -> {
-                    IntentNode node = ns.getNode();
-                    String key = nodeKey(node);
-                    List<RetrievedChunk> chunks = intentChunks == null ? null : intentChunks.get(key);
-                    return CollUtil.isNotEmpty(chunks);
-                })
-                .toList();
-
-        if (retained.isEmpty()) {
-            // 没有任何可用意图：无基模板（上层可根据业务选择 fallback）
+        if (eligibleIntents.isEmpty()) {
             return new PromptPlan(Collections.emptyList(), null);
         }
 
-        // 2) 单 / 多意图的模板与片段策略
-        if (retained.size() == 1) {
-            IntentNode only = retained.get(0).getNode();
+        if (eligibleIntents.size() == 1) {
+            IntentNode only = eligibleIntents.get(0).getNode();
             String tpl = StrUtil.emptyIfNull(only.getPromptTemplate()).trim();
-
             if (StrUtil.isNotBlank(tpl)) {
-                // 单意图 + 有模板：使用模板本身
-                return new PromptPlan(retained, tpl);
-            } else {
-                // 单意图 + 无模板：走默认模板
-                return new PromptPlan(retained, null);
+                return new PromptPlan(eligibleIntents, tpl);
             }
-        } else {
-            // 多意图：统一默认模板
-            return new PromptPlan(retained, null);
         }
+        return new PromptPlan(eligibleIntents, null);
     }
 
     private PromptBuildPlan plan(PromptContext context) {
@@ -147,7 +149,7 @@ public class RAGPromptService {
     }
 
     private PromptBuildPlan planKbOnly(PromptContext context) {
-        PromptPlan plan = planPrompt(context.getKbIntents(), context.getIntentChunks());
+        PromptPlan plan = planPrompt(context.getKbIntents(), context.getEligibleIntentIds());
         return PromptBuildPlan.builder()
                 .scene(PromptScene.KB_ONLY)
                 .baseTemplate(plan.getBaseTemplate())
@@ -188,26 +190,54 @@ public class RAGPromptService {
 
     private String defaultTemplate(PromptScene scene) {
         return switch (scene) {
-            case KB_ONLY -> promptTemplateLoader.load(RAG_ENTERPRISE_PROMPT_PATH);
-            case MCP_ONLY -> promptTemplateLoader.load(MCP_ONLY_PROMPT_PATH);
-            case MIXED -> promptTemplateLoader.load(MCP_KB_MIXED_PROMPT_PATH);
+            case KB_ONLY -> agentPromptResolver.resolve(AgentPromptSlot.KB_ANSWER);
+            case MCP_ONLY -> agentPromptResolver.resolve(AgentPromptSlot.MCP_ANSWER);
+            case MIXED -> agentPromptResolver.resolve(AgentPromptSlot.MIXED_ANSWER);
             case EMPTY -> "";
         };
     }
 
-    private String formatEvidence(String header, String body) {
-        return header + "\n" + body.trim();
+    private String buildUserQuestion(String question, List<String> subQuestions) {
+        if (CollUtil.isNotEmpty(subQuestions) && subQuestions.size() > 1) {
+            String numbered = IntStream.range(0, subQuestions.size())
+                    .mapToObj(i -> (i + 1) + ". " + subQuestions.get(i))
+                    .collect(Collectors.joining("\n"));
+            return renderSection("multi-questions", Map.of("questions", numbered));
+        }
+        if (StrUtil.isBlank(question)) {
+            return "";
+        }
+        return renderSection("single-question", Map.of("question", question));
     }
 
-    // === 工具方法 ===
+    private String mergeEvidenceAndQuestion(String evidenceBody, String question) {
+        if (StrUtil.isBlank(evidenceBody)) {
+            return question;
+        }
+        if (StrUtil.isBlank(question)) {
+            return evidenceBody;
+        }
+        return evidenceBody + "\n\n" + question;
+    }
 
     /**
-     * 从意图节点提取用于映射检索结果的 key
+     * 将 MCP 和 KB 证据合并为一个文本块，各自有值时用对应 section 渲染
      */
-    private static String nodeKey(IntentNode node) {
-        if (node == null) return "";
-        if (StrUtil.isNotBlank(node.getId())) return node.getId();
-        return String.valueOf(node.getId());
+    private String buildEvidenceBody(PromptContext context) {
+        StringBuilder sb = new StringBuilder();
+        if (StrUtil.isNotBlank(context.getMcpContext())) {
+            sb.append(renderSection("mcp-evidence", Map.of("body", context.getMcpContext().trim())));
+        }
+        if (StrUtil.isNotBlank(context.getKbContext())) {
+            if (!sb.isEmpty()) {
+                sb.append("\n\n");
+            }
+            sb.append(renderSection("kb-evidence", Map.of("body", context.getKbContext().trim())));
+        }
+        return sb.toString().trim();
     }
 
+    private String renderSection(String section, Map<String, String> slots) {
+        return templateLoader.renderSection(CONTEXT_FORMAT_PATH, section, slots);
+    }
 }

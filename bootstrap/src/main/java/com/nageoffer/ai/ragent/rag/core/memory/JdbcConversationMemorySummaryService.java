@@ -19,13 +19,17 @@ package com.nageoffer.ai.ragent.rag.core.memory;
 
 import cn.hutool.core.collection.CollUtil;
 import cn.hutool.core.util.StrUtil;
-import com.nageoffer.ai.ragent.rag.config.MemoryProperties;
-import com.nageoffer.ai.ragent.rag.dao.entity.ConversationMessageDO;
-import com.nageoffer.ai.ragent.rag.dao.entity.ConversationSummaryDO;
 import com.nageoffer.ai.ragent.framework.convention.ChatMessage;
+import com.nageoffer.ai.ragent.rag.core.source.CitationMarkup;
 import com.nageoffer.ai.ragent.framework.convention.ChatRequest;
 import com.nageoffer.ai.ragent.infra.chat.LLMService;
+import com.nageoffer.ai.ragent.infra.enums.Tier;
+import com.nageoffer.ai.ragent.rag.config.MemoryProperties;
+import com.nageoffer.ai.ragent.rag.core.prompt.AgentPromptResolver;
+import com.nageoffer.ai.ragent.rag.core.prompt.AgentPromptSlot;
 import com.nageoffer.ai.ragent.rag.core.prompt.PromptTemplateLoader;
+import com.nageoffer.ai.ragent.rag.dao.entity.ConversationMessageDO;
+import com.nageoffer.ai.ragent.rag.dao.entity.ConversationSummaryDO;
 import com.nageoffer.ai.ragent.rag.service.ConversationGroupService;
 import com.nageoffer.ai.ragent.rag.service.ConversationMessageService;
 import com.nageoffer.ai.ragent.rag.service.bo.ConversationSummaryBO;
@@ -33,10 +37,8 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -44,28 +46,24 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.CONVERSATION_SUMMARY_PROMPT_PATH;
+import static com.nageoffer.ai.ragent.rag.constant.RAGConstant.CONTEXT_FORMAT_PATH;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class JdbcConversationMemorySummaryService implements ConversationMemorySummaryService {
 
-    private static final String SUMMARY_PREFIX = "对话摘要：";
     private static final String SUMMARY_LOCK_PREFIX = "ragent:memory:summary:lock:";
-    private static final Duration SUMMARY_LOCK_TTL = Duration.ofMinutes(5);
 
     private final ConversationGroupService conversationGroupService;
     private final ConversationMessageService conversationMessageService;
     private final MemoryProperties memoryProperties;
     private final LLMService llmService;
     private final PromptTemplateLoader promptTemplateLoader;
+    private final AgentPromptResolver agentPromptResolver;
     private final RedissonClient redissonClient;
-
-    @Qualifier("memorySummaryThreadPoolExecutor")
     private final Executor memorySummaryExecutor;
 
     @Override
@@ -95,12 +93,11 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
         if (summary == null || StrUtil.isBlank(summary.getContent())) {
             return summary;
         }
-
-        String content = summary.getContent().trim();
-        if (content.startsWith(SUMMARY_PREFIX) || content.startsWith("摘要：")) {
-            return summary;
-        }
-        return ChatMessage.system(SUMMARY_PREFIX + content);
+        String wrapped = promptTemplateLoader.renderSection(
+                CONTEXT_FORMAT_PATH, "summary-wrapper",
+                Map.of("content", summary.getContent().trim())
+        );
+        return ChatMessage.system(wrapped);
     }
 
     private void doCompressIfNeeded(String conversationId, String userId) {
@@ -113,7 +110,7 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
 
         String lockKey = SUMMARY_LOCK_PREFIX + buildLockKey(conversationId, userId);
         RLock lock = redissonClient.getLock(lockKey);
-        if (!tryLock(lock)) {
+        if (!lock.tryLock()) {
             return;
         }
         try {
@@ -131,13 +128,19 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
             if (latestUserTurns.isEmpty()) {
                 return;
             }
-            String cutoffId = resolveCutoffId(latestUserTurns);
-            if (StrUtil.isBlank(cutoffId)) {
+            String historyStartId = resolveHistoryStartId(latestUserTurns);
+            if (StrUtil.isBlank(historyStartId)) {
                 return;
             }
 
             String afterId = resolveSummaryStartId(conversationId, userId, latestSummary);
-            if (afterId != null && Long.parseLong(afterId) >= Long.parseLong(cutoffId)) {
+            if (afterId != null && Long.parseLong(afterId) >= Long.parseLong(historyStartId)) {
+                return;
+            }
+
+            // 摘要覆盖约一半原文窗口；只有这段重叠滑出窗口后才再次生成摘要
+            String summaryCutoffId = resolveSummaryCutoffId(latestUserTurns);
+            if (StrUtil.isBlank(summaryCutoffId)) {
                 return;
             }
 
@@ -145,7 +148,7 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
                     conversationId,
                     userId,
                     afterId,
-                    cutoffId
+                    summaryCutoffId
             );
             if (CollUtil.isEmpty(toSummarize)) {
                 return;
@@ -175,15 +178,6 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
         }
     }
 
-    private boolean tryLock(RLock lock) {
-        try {
-            return lock.tryLock(0, SUMMARY_LOCK_TTL.toMillis(), TimeUnit.MILLISECONDS);
-        } catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
-    }
-
     private String summarizeMessages(List<ConversationMessageDO> messages, String existingSummary) {
         List<ChatMessage> histories = toHistoryMessages(messages);
         if (CollUtil.isEmpty(histories)) {
@@ -192,8 +186,8 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
 
         int summaryMaxChars = memoryProperties.getSummaryMaxChars();
         List<ChatMessage> summaryMessages = new ArrayList<>();
-        String summaryPrompt = promptTemplateLoader.render(
-                CONVERSATION_SUMMARY_PROMPT_PATH,
+        String summaryPrompt = agentPromptResolver.render(
+                AgentPromptSlot.CONVERSATION_SUMMARY,
                 Map.of("summary_max_chars", String.valueOf(summaryMaxChars))
         );
         summaryMessages.add(ChatMessage.system(summaryPrompt));
@@ -216,7 +210,7 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
                 .thinking(false)
                 .build();
         try {
-            String result = llmService.chat(request);
+            String result = llmService.chat(request, Tier.FAST);
             log.info("对话摘要生成 - resultChars: {}", result.length());
 
             return result;
@@ -239,7 +233,7 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
                     if ("user".equals(role)) {
                         return ChatMessage.user(item.getContent());
                     } else if ("assistant".equals(role)) {
-                        return ChatMessage.assistant(item.getContent());
+                        return ChatMessage.assistant(CitationMarkup.strip(item.getContent()));
                     }
                     return null;
                 })
@@ -269,7 +263,7 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
         return conversationGroupService.findMaxMessageIdAtOrBefore(conversationId, userId, after);
     }
 
-    private String resolveCutoffId(List<ConversationMessageDO> latestUserTurns) {
+    private String resolveHistoryStartId(List<ConversationMessageDO> latestUserTurns) {
         if (CollUtil.isEmpty(latestUserTurns)) {
             return null;
         }
@@ -277,6 +271,15 @@ public class JdbcConversationMemorySummaryService implements ConversationMemoryS
         // 倒序列表的最后一个就是最早的
         ConversationMessageDO oldest = latestUserTurns.get(latestUserTurns.size() - 1);
         return oldest == null ? null : oldest.getId();
+    }
+
+    private String resolveSummaryCutoffId(List<ConversationMessageDO> latestUserTurns) {
+        if (CollUtil.isEmpty(latestUserTurns)) {
+            return null;
+        }
+
+        ConversationMessageDO overlapBoundary = latestUserTurns.get((latestUserTurns.size() - 1) / 2);
+        return overlapBoundary == null ? null : overlapBoundary.getId();
     }
 
     private String resolveLastMessageId(List<ConversationMessageDO> toSummarize) {

@@ -17,7 +17,9 @@
 
 package com.nageoffer.ai.ragent.ingestion.domain.context;
 
-import com.nageoffer.ai.ragent.core.chunk.VectorChunk;
+import com.nageoffer.ai.ragent.core.chunk.model.EmbeddedChunk;
+import com.nageoffer.ai.ragent.core.ingest.VectorTarget;
+import com.nageoffer.ai.ragent.core.parser.model.AssetRef;
 import com.nageoffer.ai.ragent.ingestion.domain.enums.IngestionStatus;
 import com.nageoffer.ai.ragent.rag.core.vector.VectorSpaceId;
 import lombok.AllArgsConstructor;
@@ -25,6 +27,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -76,7 +79,15 @@ public class IngestionContext {
     /**
      * 文档切分后的文本块列表
      */
-    private List<VectorChunk> chunks;
+    private List<EmbeddedChunk> chunks;
+
+    /**
+     * 向量落点：逻辑分区 + 嵌入模型 + 维度，由调用方从知识库配置派生
+     * <p>
+     * 原先分块节点用 {@code embed(chunks, null)} 回落系统默认模型，与上传路径用知识库配置的模型
+     * 不一致，同一分区里会混进两种语义空间的向量。落点显式下发之后，这条缺陷表达不出来
+     */
+    private VectorTarget vectorTarget;
 
     /**
      * 经过增强处理后的文本内容
@@ -125,4 +136,13 @@ public class IngestionContext {
      */
     @Builder.Default
     private boolean skipIndexerWrite = false;
+
+    /**
+     * 文档级资产引用列表（v1.1 多模态解析改造引入）
+     * <p>
+     * 由 DocumentParser 在解析阶段产生（如 MinerU 解包图片上传 RustFS 后），
+     * ChunkerNode 把对应 AssetRef 回填到对应块的元数据
+     */
+    @Builder.Default
+    private List<AssetRef> assets = new ArrayList<>();
 }

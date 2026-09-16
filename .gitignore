@@ -42,3 +42,8 @@ node_modules/
 dist/
 .vite/
 .env.local
+resources/docker/graphrag/.env
+
+### Tmp Out ###
+.output/
+docs/temp

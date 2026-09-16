@@ -19,11 +19,13 @@ package com.nageoffer.ai.ragent.ingestion.node;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.nageoffer.ai.ragent.core.chunk.ChunkEmbeddingService;
-import com.nageoffer.ai.ragent.core.chunk.ChunkingOptions;
-import com.nageoffer.ai.ragent.core.chunk.ChunkingStrategyFactory;
-import com.nageoffer.ai.ragent.core.chunk.VectorChunk;
-import com.nageoffer.ai.ragent.core.chunk.ChunkingStrategy;
+import com.nageoffer.ai.ragent.core.chunk.ChunkingService;
+import com.nageoffer.ai.ragent.core.chunk.model.Chunk;
+import com.nageoffer.ai.ragent.core.chunk.model.ChunkBudget;
+import com.nageoffer.ai.ragent.core.chunk.model.EmbeddedChunk;
+import com.nageoffer.ai.ragent.core.ingest.VectorTarget;
+import com.nageoffer.ai.ragent.core.ingest.embed.ChunkEmbeddingService;
+import com.nageoffer.ai.ragent.core.parser.model.Block;
 import com.nageoffer.ai.ragent.framework.exception.ClientException;
 import com.nageoffer.ai.ragent.ingestion.domain.context.IngestionContext;
 import com.nageoffer.ai.ragent.ingestion.domain.enums.IngestionNodeType;
@@ -32,22 +34,27 @@ import com.nageoffer.ai.ragent.ingestion.domain.result.NodeResult;
 import com.nageoffer.ai.ragent.ingestion.domain.settings.ChunkerSettings;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
-import org.springframework.util.StringUtils;
 
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
- * 文本分块节点
- * 负责将输入的完整文本（原始文本或增强后的文本）按照指定的策略切分成多个较小的文本块（Chunk）
+ * 分块节点：把 Block 列表按预算切块并向量化
+ * <p>
+ * 两处随内核化收窄的适配：分块参数从"策略枚举 + 一堆自由键"收敛成 {@link ChunkBudget}；
+ * 向量化从 {@code embed(chunks, null)} 改为按上下文里的向量落点，因此不再与上传路径用不同的模型
  */
 @Component
 @RequiredArgsConstructor
 public class ChunkerNode implements IngestionNode {
 
+    /**
+     * 不分块哨兵：沿用前端既有约定的 {@code -1}，在此翻译成整文档预算
+     */
+    private static final int WHOLE_DOCUMENT_SENTINEL = -1;
+
     private final ObjectMapper objectMapper;
-    private final ChunkingStrategyFactory chunkingStrategyFactory;
     private final ChunkEmbeddingService chunkEmbeddingService;
+    private final ChunkingService chunkingService;
 
     @Override
     public String getNodeType() {
@@ -56,52 +63,48 @@ public class ChunkerNode implements IngestionNode {
 
     @Override
     public NodeResult execute(IngestionContext context, NodeConfig config) {
-        String text = StringUtils.hasText(context.getEnhancedText()) ? context.getEnhancedText() : context.getRawText();
-        if (!StringUtils.hasText(text)) {
-            return NodeResult.fail(new ClientException("可分块文本为空"));
-        }
-        ChunkerSettings settings = parseSettings(config.getSettings());
-        ChunkingStrategy chunker = chunkingStrategyFactory.requireStrategy(settings.getStrategy());
-        if (chunker == null) {
-            return NodeResult.fail(new ClientException("未找到分块策略: " + settings.getStrategy()));
+        VectorTarget target = context.getVectorTarget();
+        if (target == null) {
+            return NodeResult.fail(new ClientException("分块节点缺少向量落点（分区 / 嵌入模型 / 维度）"));
         }
 
-        ChunkingOptions chunkConfig = convertToChunkConfig(settings);
-        List<VectorChunk> results = chunker.chunk(text, chunkConfig);
-        List<VectorChunk> chunks = convertToVectorChunks(results);
+        List<Block> blocks = context.getDocument() == null ? null : context.getDocument().getBlocks();
+        List<Chunk> chunks = chunkingService.chunk(blocks, toBudget(parseSettings(config.getSettings())));
+        if (chunks.isEmpty()) {
+            return NodeResult.fail(new ClientException("分块结果为空"));
+        }
 
-        // 嵌入：为切分后的文本块生成向量
-        chunkEmbeddingService.embed(chunks, null);
-
-        context.setChunks(chunks);
-        return NodeResult.ok("已分块 " + chunks.size() + " 段");
-    }
-
-    private ChunkingOptions convertToChunkConfig(ChunkerSettings settings) {
-        return settings.getStrategy().createDefaultOptions(
-                settings.getChunkSize(), settings.getOverlapSize());
-    }
-
-    private List<VectorChunk> convertToVectorChunks(List<VectorChunk> results) {
-        return results.stream()
-                .map(result -> VectorChunk.builder()
-                        .chunkId(result.getChunkId())
-                        .index(result.getIndex())
-                        .content(result.getContent())
-                        .metadata(result.getMetadata())
-                        .embedding(result.getEmbedding())
-                        .build())
-                .collect(Collectors.toList());
+        List<EmbeddedChunk> embedded = chunkEmbeddingService.embed(chunks, target);
+        context.setChunks(embedded);
+        return NodeResult.ok("已分块 " + embedded.size() + " 段");
     }
 
     private ChunkerSettings parseSettings(JsonNode node) {
         ChunkerSettings settings = objectMapper.convertValue(node, ChunkerSettings.class);
-        if (settings.getChunkSize() == null || settings.getChunkSize() <= 0) {
-            settings.setChunkSize(512);
+        return settings == null ? ChunkerSettings.builder().build() : settings;
+    }
+
+    /**
+     * 把管道设置里的三个整数翻译成预算；缺失或非法一律取系统默认，默认值只有一份
+     */
+    private ChunkBudget toBudget(ChunkerSettings settings) {
+        Integer chunkSize = settings.getChunkSize();
+        if (chunkSize != null && chunkSize == WHOLE_DOCUMENT_SENTINEL) {
+            return ChunkBudget.wholeDocument();
         }
-        if (settings.getOverlapSize() == null || settings.getOverlapSize() < 0) {
-            settings.setOverlapSize(128);
+        ChunkBudget defaults = ChunkBudget.defaults();
+        int maxChars = chunkSize != null && chunkSize > 0 ? chunkSize : defaults.maxChars();
+        // 重叠缺省按块大小等比给，而不是照搬默认预算里那个配 1024 的数
+        int overlap = settings.getOverlapSize() != null && settings.getOverlapSize() >= 0
+                ? settings.getOverlapSize()
+                : ChunkBudget.defaultOverlapFor(maxChars);
+        // 重叠必须小于块大小，否则切分无法推进
+        if (overlap >= maxChars) {
+            overlap = Math.max(0, maxChars - 1);
         }
-        return settings;
+        int rowsPerChunk = settings.getRowsPerChunk() != null && settings.getRowsPerChunk() > 0
+                ? settings.getRowsPerChunk()
+                : defaults.rowsPerChunk();
+        return new ChunkBudget(maxChars, overlap, rowsPerChunk);
     }
 }

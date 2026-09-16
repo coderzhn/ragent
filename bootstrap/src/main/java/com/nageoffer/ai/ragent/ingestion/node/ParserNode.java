@@ -19,6 +19,12 @@ package com.nageoffer.ai.ragent.ingestion.node;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nageoffer.ai.ragent.core.parser.BlockTextRenderer;
+import com.nageoffer.ai.ragent.core.parser.DocumentParser;
+import com.nageoffer.ai.ragent.core.parser.model.Block;
+import com.nageoffer.ai.ragent.core.parser.model.ParsedDocument;
+import com.nageoffer.ai.ragent.core.parser.registry.ParseProfile;
+import com.nageoffer.ai.ragent.core.parser.registry.ParserRegistry;
 import com.nageoffer.ai.ragent.framework.exception.ClientException;
 import com.nageoffer.ai.ragent.ingestion.domain.context.IngestionContext;
 import com.nageoffer.ai.ragent.ingestion.domain.context.StructuredDocument;
@@ -26,15 +32,12 @@ import com.nageoffer.ai.ragent.ingestion.domain.enums.IngestionNodeType;
 import com.nageoffer.ai.ragent.ingestion.domain.pipeline.NodeConfig;
 import com.nageoffer.ai.ragent.ingestion.domain.result.NodeResult;
 import com.nageoffer.ai.ragent.ingestion.domain.settings.ParserSettings;
-import com.nageoffer.ai.ragent.ingestion.util.MimeTypeDetector;
-import com.nageoffer.ai.ragent.core.parser.DocumentParser;
-import com.nageoffer.ai.ragent.core.parser.DocumentParserSelector;
-import com.nageoffer.ai.ragent.core.parser.ParseResult;
-import com.nageoffer.ai.ragent.core.parser.ParserType;
+import com.nageoffer.ai.ragent.core.parser.mime.MimeTypeDetector;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -46,11 +49,11 @@ import java.util.Map;
 public class ParserNode implements IngestionNode {
 
     private final ObjectMapper objectMapper;
-    private final DocumentParserSelector parserSelector;
+    private final ParserRegistry parserRegistry;
 
-    public ParserNode(ObjectMapper objectMapper, DocumentParserSelector parserSelector) {
+    public ParserNode(ObjectMapper objectMapper, ParserRegistry parserRegistry) {
         this.objectMapper = objectMapper;
-        this.parserSelector = parserSelector;
+        this.parserRegistry = parserRegistry;
     }
 
     @Override
@@ -78,23 +81,46 @@ public class ParserNode implements IngestionNode {
         validateMimeType(settings, mimeType, fileName);
 
         ParserSettings.ParserRule rule = matchRule(settings, mimeType, fileName);
-        DocumentParser parser = parserSelector.select(ParserType.TIKA.getType());
+
+        // 按 (MIME × 档位) 查注册表；不匹配显式抛错，不静默兜底
+        // 管道暂无档位入口，走默认档；档位随 IngestionSpec 下发是内核化之后的事
+        DocumentParser parser = parserRegistry.find(mimeType, ParseProfile.defaultProfile()).orElse(null);
         if (parser == null) {
-            return NodeResult.fail(new ClientException("未配置 Tika 解析器"));
+            return NodeResult.fail(new ClientException(
+                    "未找到 MIME [" + mimeType + "] 对应的解析器,fileName=" + fileName));
         }
 
-        Map<String, Object> options = rule == null ? Collections.emptyMap() : rule.getOptions();
-        ParseResult result = parser.parse(context.getRawBytes(), mimeType, options);
-        context.setRawText(result.text());
+        Map<String, Object> ruleOptions = rule == null ? null : rule.getOptions();
+        Map<String, Object> options = new HashMap<>(ruleOptions != null ? ruleOptions : Collections.emptyMap());
 
-        // 将 ParseResult 转换为 StructuredDocument
+        // 把 sourceFile 注入 options，供解析器写入 Provenance.sourceFile
+        if (StringUtils.hasText(fileName) && !options.containsKey("sourceFile")) {
+            options.put("sourceFile", fileName);
+        }
+
+        // 把 documentId(=taskId)注入 options，供解析器做资产 key 命名 assets/{documentId}/...
+        // 图片解析必需，MinerU 抽图同样受益(资产稳定归属文档目录，不再落随机 UUID)
+        if (StringUtils.hasText(context.getTaskId()) && !options.containsKey("documentId")) {
+            options.put("documentId", context.getTaskId());
+        }
+
+        // v1.1：调 parseStructured 拿结构化 Block 列表
+        ParsedDocument parsed = parser.parseStructured(context.getRawBytes(), mimeType, options);
+        List<Block> blocks = parsed.blocks() == null ? List.of() : parsed.blocks();
+
+        // 从 blocks 渲染纯文本（给老路径 / ChunkerNode fallback 用）
+        String renderedText = BlockTextRenderer.render(blocks);
+        context.setRawText(renderedText);
+
         StructuredDocument document = StructuredDocument.builder()
-                .text(result.text())
-                .metadata(result.metadata())
+                .text(renderedText)
+                .blocks(blocks)
+                .metadata(parsed.metadata())
                 .build();
         context.setDocument(document);
 
-        return NodeResult.ok("解析文本长度=" + (result.text() == null ? 0 : result.text().length()));
+        return NodeResult.ok(String.format("解析器=%s, blocks=%d, 文本长度=%d",
+                parser.getParserType(), blocks.size(), renderedText.length()));
     }
 
     /**

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
+  Bot,
   ChevronDown,
   ChevronRight,
   ChevronsLeft,
@@ -17,6 +18,8 @@ import {
   MessageSquare,
   KeyRound,
   Search,
+  Share2,
+  ShieldCheck,
   Settings,
   Upload,
   Users,
@@ -57,6 +60,8 @@ type MenuItem = {
   path: string;
   label: string;
   icon: any;
+  /** 字形本身偏小的图标在这里补一个视觉尺寸修正，跟同栏其余图标找齐 */
+  iconClass?: string;
   search?: string;
   children?: MenuChild[];
 };
@@ -76,9 +81,20 @@ const menuGroups: MenuGroup[] = [
         icon: LayoutDashboard
       },
       {
+        path: "/admin/agents",
+        label: "智能体管理",
+        icon: Bot,
+        iconClass: "admin-sidebar__item-icon--optical-lg"
+      },
+      {
         path: "/admin/knowledge",
         label: "知识库管理",
         icon: Database
+      },
+      {
+        path: "/admin/knowledge-graph",
+        label: "知识图谱",
+        icon: Share2
       },
       {
         id: "intent",
@@ -128,6 +144,11 @@ const menuGroups: MenuGroup[] = [
         label: "链路追踪",
         icon: Workflow
       },
+      {
+        path: "/admin/change-logs",
+        label: "审计日志",
+        icon: ShieldCheck
+      },
     ]
   },
   {
@@ -154,11 +175,14 @@ const menuGroups: MenuGroup[] = [
 
 const breadcrumbMap: Record<string, string> = {
   dashboard: "Dashboard",
+  agents: "智能体管理",
   knowledge: "知识库管理",
+  "knowledge-graph": "知识图谱",
   "intent-tree": "意图树配置",
   "intent-list": "意图列表",
   ingestion: "数据通道",
   traces: "链路追踪",
+  "change-logs": "审计日志",
   "sample-questions": "示例问题",
   mappings: "关键词映射",
   settings: "系统设置",
@@ -187,6 +211,8 @@ export function AdminLayout() {
   const blurTimeoutRef = useRef<number | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const isDashboardRoute = location.pathname.startsWith("/admin/dashboard");
+  // 知识图谱页要沉浸式铺满，去掉内容区内边距与面包屑
+  const isGraphRoute = location.pathname.startsWith("/admin/knowledge-graph");
 
   const handleLogout = async () => {
     await logout();
@@ -303,11 +329,15 @@ export function AdminLayout() {
     }
 
     if (section === "knowledge" && segments.includes("docs")) {
-      items.push({ label: "切片管理" });
+      items.push({ label: "分块管理" });
     }
 
     if (section === "traces" && segments.length > 2) {
       items.push({ label: "链路详情" });
+    }
+
+    if (section === "agents" && segments.length > 2) {
+      items.push({ label: "提示词配置" });
     }
 
     return items;
@@ -437,7 +467,9 @@ export function AdminLayout() {
       <aside className={cn("admin-sidebar", collapsed && "admin-sidebar--collapsed")}>
         <div className="admin-sidebar__brand">
           <div className={cn("flex items-center gap-3", collapsed && "justify-center")}>
-            <div className="admin-sidebar__logo">R</div>
+            <div className="admin-sidebar__logo">
+              <Bot className="h-[22px] w-[22px]" />
+            </div>
             {!collapsed && (
               <div className="min-w-0">
                 <h1 className="admin-sidebar__title">Ragent AI 管理后台</h1>
@@ -475,7 +507,7 @@ export function AdminLayout() {
                             isActive && "is-active"
                           )}
                         />
-                        <Icon className="admin-sidebar__item-icon" />
+                        <Icon className={cn("admin-sidebar__item-icon", item.iconClass)} />
                         {collapsed ? <span className="sr-only">{item.label}</span> : <span>{item.label}</span>}
                       </Link>
                     );
@@ -529,7 +561,7 @@ export function AdminLayout() {
                                 isGroupActive && "is-group-active"
                               )}
                             />
-                        <item.icon className="admin-sidebar__item-icon" />
+                        <item.icon className={cn("admin-sidebar__item-icon", item.iconClass)} />
                         <span className="flex-1 text-left">{item.label}</span>
                         {isOpen ? (
                           <ChevronDown className="h-4 w-4 text-white/60" />
@@ -683,7 +715,7 @@ export function AdminLayout() {
               <Button
                 variant="outline"
                 className="hidden items-center gap-2 sm:inline-flex"
-                onClick={() => navigate("/chat")}
+                onClick={() => window.open("/chat", "_blank")}
               >
                 <MessageSquare className="h-4 w-4" />
                 返回聊天
@@ -736,22 +768,24 @@ export function AdminLayout() {
           </div>
         </header>
 
-        <div className="admin-content">
-          <nav className="admin-breadcrumbs" aria-label="面包屑">
-            {breadcrumbs.map((item, index) => {
-              const isLast = index === breadcrumbs.length - 1;
-              return (
-                <span key={`${item.label}-${index}`} className="flex items-center gap-2">
-                  {item.to && !isLast ? (
-                    <Link to={item.to}>{item.label}</Link>
-                  ) : (
-                    <span className={isLast ? "text-slate-700" : undefined}>{item.label}</span>
-                  )}
-                  {!isLast && <span>/</span>}
-                </span>
-              );
-            })}
-          </nav>
+        <div className={cn("admin-content", isGraphRoute && "admin-content--full")}>
+          {!isGraphRoute && (
+            <nav className="admin-breadcrumbs" aria-label="面包屑">
+              {breadcrumbs.map((item, index) => {
+                const isLast = index === breadcrumbs.length - 1;
+                return (
+                  <span key={`${item.label}-${index}`} className="flex items-center gap-2">
+                    {item.to && !isLast ? (
+                      <Link to={item.to}>{item.label}</Link>
+                    ) : (
+                      <span className={isLast ? "text-slate-700" : undefined}>{item.label}</span>
+                    )}
+                    {!isLast && <span>/</span>}
+                  </span>
+                );
+              })}
+            </nav>
+          )}
           <Outlet />
         </div>
       </div>

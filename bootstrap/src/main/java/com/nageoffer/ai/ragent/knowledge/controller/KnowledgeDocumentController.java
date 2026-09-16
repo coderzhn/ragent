@@ -22,14 +22,19 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.nageoffer.ai.ragent.knowledge.controller.request.KnowledgeDocumentPageRequest;
 import com.nageoffer.ai.ragent.knowledge.controller.request.KnowledgeDocumentUploadRequest;
 import com.nageoffer.ai.ragent.knowledge.controller.request.KnowledgeDocumentUpdateRequest;
+import com.nageoffer.ai.ragent.knowledge.controller.vo.IngestionSpecSchemaVO;
 import com.nageoffer.ai.ragent.knowledge.controller.vo.KnowledgeDocumentVO;
 import com.nageoffer.ai.ragent.knowledge.controller.vo.KnowledgeDocumentChunkLogVO;
 import com.nageoffer.ai.ragent.knowledge.controller.vo.KnowledgeDocumentSearchVO;
 import com.nageoffer.ai.ragent.framework.convention.Result;
 import com.nageoffer.ai.ragent.framework.web.Results;
 import com.nageoffer.ai.ragent.knowledge.service.KnowledgeDocumentService;
+import com.nageoffer.ai.ragent.knowledge.support.IngestionSpecSchemaProvider;
+import com.nageoffer.ai.ragent.rag.service.FileStorageService;
+import jakarta.servlet.http.HttpServletResponse;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.MediaType;
+import org.springframework.util.StreamUtils;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -44,7 +49,11 @@ import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.InputStream;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 知识库文档管理控制器
@@ -56,6 +65,30 @@ import java.util.List;
 public class KnowledgeDocumentController {
 
     private final KnowledgeDocumentService documentService;
+    private final FileStorageService fileStorageService;
+    private final IngestionSpecSchemaProvider ingestionSpecSchemaProvider;
+
+    private static final Map<String, String> CONTENT_TYPE_MAP = Map.ofEntries(
+            Map.entry("pdf", "application/pdf"),
+            Map.entry("markdown", "text/markdown"),
+            Map.entry("md", "text/markdown"),
+            Map.entry("txt", "text/plain"),
+            Map.entry("csv", "text/csv;charset=utf-8"),
+            Map.entry("xls", "application/vnd.ms-excel"),
+            Map.entry("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            Map.entry("png", "image/png"),
+            Map.entry("jpg", "image/jpeg"),
+            Map.entry("jpeg", "image/jpeg"),
+            Map.entry("svg", "image/svg+xml")
+    );
+
+    /**
+     * 查询摄取配置的表单 schema：描述的正是上传与更新接口里的 {@code ingestionSpec} 字段
+     */
+    @GetMapping("/knowledge-base/docs/ingestion-spec-schema")
+    public Result<IngestionSpecSchemaVO> getIngestionSpecSchema() {
+        return Results.success(ingestionSpecSchemaProvider.describe());
+    }
 
     /**
      * 上传文档：入库记录 + 文件落盘，返回文档ID
@@ -138,5 +171,28 @@ public class KnowledgeDocumentController {
     public Result<IPage<KnowledgeDocumentChunkLogVO>> getChunkLogs(@PathVariable String docId,
                                                                    Page<KnowledgeDocumentChunkLogVO> page) {
         return Results.success(documentService.getChunkLogs(docId, page));
+    }
+
+    /**
+     * 预览 markdown 文档内容
+     */
+    @GetMapping("/knowledge-base/docs/{docId}/preview")
+    public Result<String> preview(@PathVariable String docId) {
+        return Results.success(documentService.preview(docId));
+    }
+
+    /**
+     * 获取文档源文件（用于 PDF/图片等浏览器原生支持的格式直接渲染）
+     */
+    @GetMapping("/knowledge-base/docs/{docId}/file")
+    public void file(@PathVariable String docId, HttpServletResponse response) throws Exception {
+        var doc = documentService.get(docId);
+        String fileType = doc.getFileType() != null ? doc.getFileType().toLowerCase() : "";
+        String contentType = CONTENT_TYPE_MAP.getOrDefault(fileType, "application/octet-stream");
+        response.setContentType(contentType);
+        response.setHeader("Content-Disposition", "inline; filename=\"" + URLEncoder.encode(doc.getDocName(), StandardCharsets.UTF_8) + "\"");
+        try (InputStream in = fileStorageService.openStream(doc.getFileUrl())) {
+            StreamUtils.copy(in, response.getOutputStream());
+        }
     }
 }

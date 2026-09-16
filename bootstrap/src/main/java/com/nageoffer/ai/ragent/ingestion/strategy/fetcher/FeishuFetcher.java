@@ -23,13 +23,14 @@ import com.nageoffer.ai.ragent.framework.exception.ServiceException;
 import com.nageoffer.ai.ragent.ingestion.domain.context.DocumentSource;
 import com.nageoffer.ai.ragent.ingestion.domain.enums.SourceType;
 import com.nageoffer.ai.ragent.ingestion.util.HttpClientHelper;
-import com.nageoffer.ai.ragent.ingestion.util.MimeTypeDetector;
+import com.nageoffer.ai.ragent.core.parser.mime.MimeTypeDetector;
 import lombok.RequiredArgsConstructor;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StringUtils;
 
@@ -47,6 +48,7 @@ public class FeishuFetcher implements DocumentFetcher {
 
     private static final String TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal/";
 
+    @Qualifier("syncHttpClient")
     private final OkHttpClient okHttpClient;
     private final HttpClientHelper httpClientHelper;
 
