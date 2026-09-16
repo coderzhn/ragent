@@ -6,8 +6,7 @@ server:
 spring:
   application:
     name: ragent${unique-name:}-service
-  profiles:
-    active: local
+
   servlet:
     multipart:
       max-file-size: 50MB
