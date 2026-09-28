@@ -3,7 +3,13 @@ temp
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
-
+# Understood-Anything 临时/中间产物
+.ua/intermediate/
+.ua/tmp/
+.ua/*.log
+.ua/diff-overlay.json
+# Note: .ua/knowledge-graph.json, .ua/meta.json, .ua/fingerprints.json, .ua/config.json, .ua/.understandignore,
+# and .ua/intermediate/scan-result.json are intentionally tracked so other environments can run /understand without re-analysis.
 ### STS ###
 .apt_generated
 .classpath
