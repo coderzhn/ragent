@@ -120,7 +120,7 @@ public class AgentChatServiceImpl implements AgentChatService {
     }
 
     /**
-     * 只在启动失败时走：闸门不还，这个用户要被锁到 TTL 到期才能再提问
+     * 只在启动失败时走：未归还的会话锁和名额会被看门狗持续续期，直到释放或进程退出
      * 启动成功后闸门归运行句柄的释放钩子管，这里不碰
      * 两步各自兜异常，前一步失败不能连累后一步
      */
@@ -192,6 +192,7 @@ public class AgentChatServiceImpl implements AgentChatService {
         ReActAgent agent = activeAgent.agent();
         List<ToolUseBlock> asking = askingToolCalls(agent.getAgentState(userId, conversationId).getContext());
         if (asking.isEmpty()) {
+            agent.clearStateCache(userId, conversationId);
             // 状态里没有待确认工具了，先结算卡片再报错，否则会话会一直卡住
             conversationService.expirePendingConfirm(conversationId, userId, messageId);
             throw new ClientException("待确认的操作已失效，请重新提问");
@@ -267,21 +268,20 @@ public class AgentChatServiceImpl implements AgentChatService {
         String userId = scope.userId();
         String conversationId = scope.conversationId();
         runHandle.onRelease(() -> {
-            // 错误路径与强制断流框架都来不及存盘，驱逐前补存一次，否则本轮工具执行结果会丢
-            // 优雅中断已由框架中断分支存盘，不重复保存
+            // 出错或取消时，在清缓存前尝试补存当前状态；优雅中断的流结束也不代表框架存盘成功
+            // 正常完成仍由框架保存，不重复补存
             if (runHandle.isStateSaveRequired()) {
                 try {
                     agent.saveAgentState(userId, conversationId);
                 } catch (Exception e) {
-                    log.error("Agent 失败收尾补存盘失败, conversationId: {}", conversationId, e);
+                    log.error("Agent 收尾补存盘失败, conversationId: {}", conversationId, e);
                 }
             }
-            // 只清本次流实际使用的实例，避免重建后旧流误清新 Agent
             agent.clearStateCache(userId, conversationId);
         });
-        // 最后再放行同一用户的下一轮，避免新流加载状态后被本轮收尾清掉
+        // 最后再放行同一会话的下一轮，避免新流加载状态后被本轮收尾清掉
         runHandle.onRelease(scope.releaseGate());
-        // 放在释放并发锁之后，确保记忆抽取时名额已归还
+        // 会话锁与名额释放流程结束后，再调度记忆抽取
         runHandle.onRelease(() -> scheduleMemoryExtraction(userId, conversationId));
     }
 
@@ -367,9 +367,15 @@ public class AgentChatServiceImpl implements AgentChatService {
     private void bindEmitterLifecycle(SseEmitter emitter, AgentRunHandle runHandle, String taskId) {
         AtomicBoolean recycled = new AtomicBoolean(false);
         Runnable recycleUpstream = () -> {
-            // 已结算的不再取消，避免往 Redis 留死标记
+            // 已结算的任务不再重复提交本地取消
             if (!runHandle.isSettled() && recycled.compareAndSet(false, true)) {
-                taskManager.cancel(taskId);
+                // 中断最多等待 2 秒，随后还需补存状态，不占用容器生命周期回调线程
+                try {
+                    Schedulers.boundedElastic().schedule(() -> taskManager.cancel(taskId));
+                } catch (RuntimeException e) {
+                    recycled.set(false);
+                    log.error("提交 Agent 本地取消失败，允许后续生命周期回调重试，taskId={}", taskId, e);
+                }
             }
         };
         emitter.onTimeout(recycleUpstream);

@@ -42,21 +42,30 @@ import io.agentscope.core.message.AssistantMessage;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.ToolCallState;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.model.Model;
 import io.agentscope.core.state.AgentState;
+import io.agentscope.core.state.AgentStateStore;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -74,7 +83,9 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockStatic;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -113,7 +124,8 @@ class AgentChatServiceImplTest {
         when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(gateReleased::incrementAndGet);
         when(agentProvider.getAgent()).thenReturn(new ActiveAgent(
                 agent, new ResolvedCatalog("知识库工具描述", null, List.of(), List.of(), List.of())));
-        when(conversationService.touchConversation(anyString(), anyString(), anyString())).thenReturn("会话标题");
+        when(conversationService.touchConversation(anyString(), anyString(), anyString()))
+                .thenReturn("会话标题");
         when(conversationService.addUserMessage(anyString(), anyString(), anyString())).thenReturn("m-3003");
         // 每轮收尾都会调一次，不给默认结局其余用例会在后台线程上吃 NPE
         when(memoryPipeline.extract(anyString(), anyString(), any(AgentMemoryTriggerType.class)))
@@ -126,6 +138,53 @@ class AgentChatServiceImplTest {
         UserContext.clear();
     }
 
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"   "})
+    void shouldPrepareNewConversationWithServerGeneratedId(String requestedId) {
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
+        ArgumentCaptor<String> conversationId = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<RuntimeContext> runtimeContext = ArgumentCaptor.forClass(RuntimeContext.class);
+
+        service.streamChat("首问", requestedId, new SseEmitter());
+
+        verify(conversationService).touchConversation(conversationId.capture(), eq(USER_ID), eq("首问"));
+        assertThat(conversationId.getValue()).matches("\\d+");
+        verify(runGate).acquire(eq(USER_ID), anyString(), eq(conversationId.getValue()));
+        verify(conversationService).addUserMessage(conversationId.getValue(), USER_ID, "首问");
+        verify(agent).streamEvents(any(Msg.class), runtimeContext.capture());
+        assertThat(runtimeContext.getValue().getSessionId()).isEqualTo(conversationId.getValue());
+        verify(conversationService, never()).hasPendingConfirm(anyString(), anyString());
+    }
+
+    @Test
+    void shouldValidateExistingConversationBeforePreparingIt() {
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
+
+        service.streamChat("续问", CONVERSATION_ID, new SseEmitter());
+
+        InOrder order = inOrder(runGate, conversationService);
+        order.verify(runGate).acquire(eq(USER_ID), anyString(), eq(CONVERSATION_ID));
+        order.verify(conversationService).hasPendingConfirm(CONVERSATION_ID, USER_ID);
+        order.verify(conversationService).touchConversation(CONVERSATION_ID, USER_ID, "续问");
+        order.verify(conversationService).addUserMessage(CONVERSATION_ID, USER_ID, "续问");
+    }
+
+    @Test
+    void shouldStopStartupWhenExistingConversationIsUnavailable() {
+        when(conversationService.hasPendingConfirm(CONVERSATION_ID, USER_ID))
+                .thenThrow(new ClientException("会话不存在"));
+
+        assertThatThrownBy(() -> service.streamChat("续问", CONVERSATION_ID, new SseEmitter()))
+                .isInstanceOf(ClientException.class).hasMessageContaining("会话不存在");
+
+        verify(conversationService, never()).touchConversation(anyString(), anyString(), anyString());
+        verify(conversationService, never()).addUserMessage(anyString(), anyString(), anyString());
+        verify(taskManager, never()).register(anyString(), anyString(), any());
+        verifyNoInteractions(agentProvider, agent, memoryPipeline);
+        assertThat(gateReleased.get()).isOne();
+    }
+
     @Test
     void shouldEvictStateCacheWhenStreamCompletes() {
         when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
@@ -134,7 +193,22 @@ class AgentChatServiceImplTest {
 
         // 不驱逐则每个 (用户, 会话) 的全量记忆在单例 Agent 里常驻到进程重启
         verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
-        verify(agentProvider, never()).evictStateCache(USER_ID, CONVERSATION_ID);
+        verify(agent, never()).saveAgentState(anyString(), anyString());
+    }
+
+    @Test
+    void shouldSaveStateBeforeEvictWhenStreamFails() {
+        Runnable releaseGate = mock(Runnable.class);
+        when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(releaseGate);
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class)))
+                .thenReturn(Flux.error(new IllegalStateException("上游出错")));
+
+        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
+
+        InOrder order = inOrder(agent, releaseGate);
+        order.verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        order.verify(releaseGate).run();
     }
 
     /**
@@ -246,6 +320,42 @@ class AgentChatServiceImplTest {
         assertThat(contextId(captured, AgentTraceContextKeys.REPLY_TO_MESSAGE_ID)).isEqualTo("m-3003");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldEvictStateBeforeExpiringInvalidConfirmation(boolean expirationFails) {
+        Runnable releaseGate = mock(Runnable.class);
+        when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(releaseGate);
+        when(conversationService.getPendingConfirm(CONVERSATION_ID, USER_ID, "m-4004"))
+                .thenReturn(new AgentConfirmSettlement("会话标题", "m-3003"));
+        when(agent.getAgentState(USER_ID, CONVERSATION_ID)).thenReturn(AgentState.builder()
+                .userId(USER_ID).sessionId(CONVERSATION_ID).build());
+        RuntimeException expirationFailure = new IllegalStateException("更新确认卡失败");
+        if (expirationFails) {
+            doThrow(expirationFailure).when(conversationService)
+                    .expirePendingConfirm(CONVERSATION_ID, USER_ID, "m-4004");
+        }
+
+        var failure = assertThatThrownBy(() -> service.confirmPendingTool(
+                CONVERSATION_ID, "m-4004", true, new SseEmitter()));
+        if (expirationFails) {
+            failure.isSameAs(expirationFailure);
+        } else {
+            failure.isInstanceOf(ClientException.class)
+                    .hasMessage("待确认的操作已失效，请重新提问");
+        }
+
+        // 即使更新确认卡失败，也必须先清缓存，再释放运行位。
+        InOrder order = inOrder(agent, conversationService, releaseGate);
+        order.verify(agent).getAgentState(USER_ID, CONVERSATION_ID);
+        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        order.verify(conversationService).expirePendingConfirm(CONVERSATION_ID, USER_ID, "m-4004");
+        order.verify(releaseGate).run();
+        verify(taskManager).unregister(anyString());
+        verify(taskManager, never()).register(anyString(), anyString(), any());
+        verify(agent, never()).streamEvents(any(Msg.class), any(RuntimeContext.class));
+        verify(agent, never()).saveAgentState(anyString(), anyString());
+    }
+
     /**
      * 泛型 get 落地成 String，避免 assertThat 重载歧义
      */
@@ -267,38 +377,15 @@ class AgentChatServiceImplTest {
         verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
     }
 
-    /**
-     * 强制断流时框架的中断存盘跑不到，驱逐缓存前必须先补存盘，反过来草稿已扔、存的是旧状态
-     */
     @Test
-    void shouldSaveStateBeforeEvictWhenForcedDisposal() {
-        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.never());
-        // 打断动作异常是三种强制断流入口里唯一不用等 2 秒窗口的，测试走这条
-        doThrow(new IllegalStateException("打断动作炸了")).when(agent).interrupt(USER_ID, CONVERSATION_ID);
-        ArgumentCaptor<Runnable> cancelAction = ArgumentCaptor.forClass(Runnable.class);
-        ArgumentCaptor<Runnable> finalizer = ArgumentCaptor.forClass(Runnable.class);
-
-        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
-        verify(taskManager).register(anyString(), anyString(), finalizer.capture());
-        verify(taskManager).bindHandle(anyString(), cancelAction.capture());
-        cancelAction.getValue().run();
-        finalizer.getValue().run();
-
-        InOrder order = inOrder(agent);
-        order.verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
-        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
-    }
-
-    /**
-     * 优雅中断由框架中断分支自行存盘，释放钩子不该重复保存
-     */
-    @Test
-    void shouldNotSaveStateWhenInterruptedGracefully() {
+    void shouldSaveStateBeforeEvictWhenCancelledStreamErrorsDuringInterrupt() {
+        Runnable releaseGate = mock(Runnable.class);
+        when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(releaseGate);
         Sinks.Many<AgentEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
         when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(sink.asFlux());
-        // 打断动作触发流正常完成，模拟框架在窗口内收尾
         doAnswer(invocation -> {
-            sink.tryEmitComplete();
+            assertThat(sink.tryEmitError(new IllegalStateException("中断期间上游出错")))
+                    .isEqualTo(Sinks.EmitResult.OK);
             return null;
         }).when(agent).interrupt(USER_ID, CONVERSATION_ID);
         ArgumentCaptor<Runnable> cancelAction = ArgumentCaptor.forClass(Runnable.class);
@@ -307,11 +394,94 @@ class AgentChatServiceImplTest {
         service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
         verify(taskManager).register(anyString(), anyString(), finalizer.capture());
         verify(taskManager).bindHandle(anyString(), cancelAction.capture());
+        // 与 StreamTaskManager 一致：先标记取消，再中断并等待上游结束，最后取消收尾。
+        when(taskManager.isCancelled(anyString())).thenReturn(true);
+        cancelAction.getValue().run();
+        verify(agent, never()).saveAgentState(anyString(), anyString());
+        verify(agent, never()).clearStateCache(anyString(), anyString());
+        verifyNoInteractions(releaseGate);
+        finalizer.getValue().run();
+
+        InOrder order = inOrder(agent, releaseGate);
+        order.verify(agent).interrupt(USER_ID, CONVERSATION_ID);
+        order.verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        order.verify(releaseGate).run();
+        verify(agentProvider).getAgent();
+    }
+
+    /**
+     * 强制断流后先补存缓存中的状态，再清缓存并释放运行位；重复取消不得重复收尾
+     */
+    @Test
+    void shouldSaveStateBeforeEvictWhenForcedDisposal() {
+        Runnable releaseGate = mock(Runnable.class);
+        Runnable disposeUpstream = mock(Runnable.class);
+        when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(releaseGate);
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class)))
+                .thenReturn(Flux.<AgentEvent>never().doOnCancel(disposeUpstream));
+        // 打断动作异常是三种强制断流入口里唯一不用等 2 秒窗口的，测试走这条
+        doThrow(new IllegalStateException("打断动作炸了")).when(agent).interrupt(USER_ID, CONVERSATION_ID);
+        ArgumentCaptor<Runnable> cancelAction = ArgumentCaptor.forClass(Runnable.class);
+        ArgumentCaptor<Runnable> finalizer = ArgumentCaptor.forClass(Runnable.class);
+
+        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
+        verify(taskManager).register(anyString(), anyString(), finalizer.capture());
+        verify(taskManager).bindHandle(anyString(), cancelAction.capture());
+        when(taskManager.isCancelled(anyString())).thenReturn(true);
+        cancelAction.getValue().run();
+        finalizer.getValue().run();
         cancelAction.getValue().run();
         finalizer.getValue().run();
 
-        verify(agent, never()).saveAgentState(anyString(), anyString());
-        verify(agent, times(1)).clearStateCache(USER_ID, CONVERSATION_ID);
+        InOrder order = inOrder(agent, disposeUpstream, releaseGate);
+        order.verify(agent).interrupt(USER_ID, CONVERSATION_ID);
+        order.verify(disposeUpstream).run();
+        order.verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        order.verify(releaseGate).run();
+        verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        verify(taskManager).unregister(anyString());
+        verify(releaseGate).run();
+    }
+
+    /**
+     * 优雅中断的完成信号不能证明框架保存成功，取消收尾仍需补存；补存失败也必须释放资源
+     */
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void shouldSaveStateBeforeEvictWhenInterruptedGracefully(boolean stateSaveFails) {
+        Runnable releaseGate = mock(Runnable.class);
+        when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(releaseGate);
+        Sinks.Many<AgentEvent> sink = Sinks.many().unicast().onBackpressureBuffer();
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(sink.asFlux());
+        // 打断动作触发流正常完成，模拟框架在窗口内收尾
+        doAnswer(invocation -> {
+            assertThat(sink.tryEmitComplete()).isEqualTo(Sinks.EmitResult.OK);
+            return null;
+        }).when(agent).interrupt(USER_ID, CONVERSATION_ID);
+        if (stateSaveFails) {
+            doThrow(new IllegalStateException("补存失败")).when(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        }
+        ArgumentCaptor<Runnable> cancelAction = ArgumentCaptor.forClass(Runnable.class);
+        ArgumentCaptor<Runnable> finalizer = ArgumentCaptor.forClass(Runnable.class);
+
+        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
+        verify(taskManager).register(anyString(), anyString(), finalizer.capture());
+        verify(taskManager).bindHandle(anyString(), cancelAction.capture());
+        when(taskManager.isCancelled(anyString())).thenReturn(true);
+        cancelAction.getValue().run();
+        verify(agent, never()).clearStateCache(anyString(), anyString());
+        verifyNoInteractions(releaseGate);
+        finalizer.getValue().run();
+
+        InOrder order = inOrder(agent, releaseGate);
+        order.verify(agent).interrupt(USER_ID, CONVERSATION_ID);
+        order.verify(agent).saveAgentState(USER_ID, CONVERSATION_ID);
+        order.verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
+        order.verify(releaseGate).run();
+        verify(taskManager).unregister(anyString());
     }
 
     /**
@@ -319,17 +489,30 @@ class AgentChatServiceImplTest {
      */
     @Test
     void shouldNotStartAgentWhenCancelledAtRegister() {
-        doAnswer(invocation -> {
-            invocation.getArgument(2, Runnable.class).run();
-            return null;
-        }).when(taskManager).register(anyString(), anyString(), any(Runnable.class));
+        Model model = mock(Model.class);
+        AgentStateStore stateStore = mock(AgentStateStore.class);
+        // 使用真实框架验证：未启动、无缓存时，补存不会新建或加载会话状态。
+        try (ReActAgent original = ReActAgent.builder().name("pre-start-cancel")
+                .model(model).stateStore(stateStore).build()) {
+            ReActAgent unstartedAgent = spy(original);
+            when(agentProvider.getAgent()).thenReturn(new ActiveAgent(unstartedAgent,
+                    new ResolvedCatalog("知识库工具描述", null, List.of(), List.of(), List.of())));
+            doAnswer(invocation -> {
+                invocation.getArgument(2, Runnable.class).run();
+                return null;
+            }).when(taskManager).register(anyString(), anyString(), any(Runnable.class));
 
-        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
+            service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
 
-        verify(agent, never()).streamEvents(any(Msg.class), any(RuntimeContext.class));
-        // 收尾照常走完，缓存驱逐与闸门归还不受影响
-        verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
-        assertThat(gateReleased.get()).isOne();
+            InOrder order = inOrder(unstartedAgent);
+            order.verify(unstartedAgent).saveAgentState(USER_ID, CONVERSATION_ID);
+            order.verify(unstartedAgent).clearStateCache(USER_ID, CONVERSATION_ID);
+            verify(unstartedAgent, never()).streamEvents(any(Msg.class), any(RuntimeContext.class));
+            verify(unstartedAgent, never()).interrupt(anyString(), anyString());
+            verify(unstartedAgent, never()).getAgentState(anyString(), anyString());
+            verifyNoInteractions(stateStore, model);
+            assertThat(gateReleased.get()).isOne();
+        }
     }
 
     @Test
@@ -342,6 +525,9 @@ class AgentChatServiceImplTest {
         finalizer.getValue().run();
 
         verify(agent, times(1)).clearStateCache(USER_ID, CONVERSATION_ID);
+        verify(agent, never()).saveAgentState(anyString(), anyString());
+        verify(taskManager).unregister(anyString());
+        assertThat(gateReleased.get()).isOne();
     }
 
     @Test
@@ -350,7 +536,7 @@ class AgentChatServiceImplTest {
 
         service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
 
-        // 闸门不还，该用户到 TTL 过期前发不出下一轮
+        // 会话锁未归还会持续续期，当前会话无法开始下一轮
         assertThat(gateReleased.get()).isOne();
     }
 
@@ -399,7 +585,7 @@ class AgentChatServiceImplTest {
         assertThatThrownBy(() -> service.streamChat("问题", CONVERSATION_ID, new SseEmitter()))
                 .isInstanceOf(NoClassDefFoundError.class);
 
-        // 只接 RuntimeException 的话，启动段抛 Error 会把该用户挡到 TTL 过期（默认半小时）
+        // 启动段抛 Error 也要归还会话锁和名额，否则看门狗会一直续期
         assertThat(gateReleased.get()).isOne();
     }
 
@@ -420,11 +606,13 @@ class AgentChatServiceImplTest {
         assertThat(gateReleased.get()).isOne();
     }
 
-    @Test
-    void shouldGetAgentBeforeWritingConversationOrQuestion() {
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {CONVERSATION_ID})
+    void shouldGetAgentBeforeWritingConversationOrQuestion(String requestedId) {
         when(agentProvider.getAgent()).thenThrow(new IllegalStateException("Prompt 不可用"));
 
-        assertThatThrownBy(() -> service.streamChat("问题", CONVERSATION_ID, new SseEmitter()))
+        assertThatThrownBy(() -> service.streamChat("问题", requestedId, new SseEmitter()))
                 .isInstanceOf(IllegalStateException.class);
 
         verify(conversationService, never()).touchConversation(anyString(), anyString(), anyString());
@@ -657,7 +845,7 @@ class AgentChatServiceImplTest {
     @Test
     void shouldNotStartRunWhenGateRejects() {
         when(runGate.acquire(anyString(), anyString(), anyString()))
-                .thenThrow(new ClientException("当前会话处理中，请稍后再发起新的对话"));
+                .thenThrow(new ClientException("当前会话正在处理中，请稍后重试"));
 
         assertThatThrownBy(() -> service.streamChat("问题", CONVERSATION_ID, new SseEmitter()))
                 .isInstanceOf(ClientException.class);
@@ -682,7 +870,7 @@ class AgentChatServiceImplTest {
         callbacks.getAllValues().forEach(Runnable::run);
 
         // 超时只关响应不回收上游，ReAct 会在无人消费的情况下跑满迭代上限
-        verify(taskManager).cancel(taskId.getValue());
+        verify(taskManager, org.mockito.Mockito.timeout(1000)).cancel(taskId.getValue());
     }
 
     @Test
@@ -697,7 +885,7 @@ class AgentChatServiceImplTest {
         verify(emitter, atLeastOnce()).onError(callbacks.capture());
         callbacks.getAllValues().forEach(callback -> callback.accept(new IOException("客户端断开")));
 
-        verify(taskManager).cancel(taskId.getValue());
+        verify(taskManager, org.mockito.Mockito.timeout(1000)).cancel(taskId.getValue());
     }
 
     @Test
@@ -713,7 +901,42 @@ class AgentChatServiceImplTest {
         callbacks.getAllValues().forEach(Runnable::run);
 
         // 关页导致写失败时容器不报超时也不报错，只有 completion 回调兜得住
-        verify(taskManager).cancel(taskId.getValue());
+        verify(taskManager, org.mockito.Mockito.timeout(1000)).cancel(taskId.getValue());
+    }
+
+    @Test
+    void shouldRetryLocalCancellationAfterSchedulerRejectsSubmission() {
+        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.never());
+        SseEmitter emitter = mock(SseEmitter.class);
+        ArgumentCaptor<String> taskId = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<Runnable> timeoutCallback = ArgumentCaptor.forClass(Runnable.class);
+        ArgumentCaptor<Consumer<Throwable>> errorCallback = ArgumentCaptor.forClass(Consumer.class);
+        ArgumentCaptor<Runnable> completionCallback = ArgumentCaptor.forClass(Runnable.class);
+        service.streamChat("问题", CONVERSATION_ID, emitter);
+        verify(taskManager).register(taskId.capture(), anyString(), any());
+        verify(emitter, atLeastOnce()).onTimeout(timeoutCallback.capture());
+        verify(emitter, atLeastOnce()).onError(errorCallback.capture());
+        verify(emitter, atLeastOnce()).onCompletion(completionCallback.capture());
+
+        Scheduler scheduler = mock(Scheduler.class);
+        AtomicReference<Runnable> queued = new AtomicReference<>();
+        when(scheduler.schedule(any(Runnable.class)))
+                .thenThrow(new RejectedExecutionException("取消执行器繁忙"))
+                .thenAnswer(invocation -> {
+                    queued.set(invocation.getArgument(0));
+                    return mock(Disposable.class);
+                });
+        try (var schedulers = mockStatic(Schedulers.class)) {
+            schedulers.when(Schedulers::boundedElastic).thenReturn(scheduler);
+            timeoutCallback.getValue().run();
+            verify(taskManager, never()).cancel(anyString());
+            errorCallback.getValue().accept(new IOException("客户端断开"));
+            completionCallback.getValue().run();
+            verify(scheduler, times(2)).schedule(any(Runnable.class));
+            verify(taskManager, never()).cancel(anyString());
+            queued.get().run();
+            verify(taskManager, times(1)).cancel(taskId.getValue());
+        }
     }
 
     @Test
@@ -726,7 +949,7 @@ class AgentChatServiceImplTest {
         verify(emitter, atLeastOnce()).onCompletion(callbacks.capture());
         callbacks.getAllValues().forEach(Runnable::run);
 
-        // 正常完成也会触发 completion 回调，这里再取消等于每个请求都往 Redis 写一条 30 分钟死标记
+        // 正常完成也会触发 completion 回调，已结算任务无需再次提交本地取消
         verify(taskManager, never()).cancel(anyString());
     }
 }

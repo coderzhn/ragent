@@ -50,6 +50,8 @@ import io.agentscope.core.event.ToolResultEndEvent;
 import io.agentscope.core.event.ToolResultStartEvent;
 import io.agentscope.core.event.ToolResultTextDeltaEvent;
 import io.agentscope.core.message.Msg;
+import io.agentscope.core.message.TextBlock;
+import io.agentscope.core.message.ToolResultBlock;
 import io.agentscope.core.message.ToolUseBlock;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
@@ -64,6 +66,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * AgentScope 事件流 → SSE 协议转换，负责增量转发、轨迹落库与取消收尾
@@ -150,9 +153,8 @@ public class AgentStreamEventBridge {
 
     public void onEvent(AgentEvent event) {
         switch (event.getType()) {
-            case TEXT_BLOCK_DELTA -> onTextDelta(TextChannel.ANSWER, ((TextBlockDeltaEvent) event).getDelta());
-            case THINKING_BLOCK_DELTA ->
-                    onTextDelta(TextChannel.REASONING, ((ThinkingBlockDeltaEvent) event).getDelta());
+            case TEXT_BLOCK_DELTA -> onTextDelta(TextKind.ANSWER, ((TextBlockDeltaEvent) event).getDelta());
+            case THINKING_BLOCK_DELTA -> onTextDelta(TextKind.REASONING, ((ThinkingBlockDeltaEvent) event).getDelta());
             case TOOL_CALL_START -> onToolCallStart((ToolCallStartEvent) event);
             case TOOL_RESULT_START -> onToolExecutionStart((ToolResultStartEvent) event);
             case TOOL_RESULT_TEXT_DELTA -> onToolResultDelta((ToolResultTextDeltaEvent) event);
@@ -184,18 +186,18 @@ public class AgentStreamEventBridge {
             String content;
             boolean resend;
             synchronized (stateLock) {
-                String streamed = textOf(TextChannel.ANSWER);
+                String streamed = textOf(TextKind.ANSWER);
                 // 优先用流式增量，为空时回退到终答消息
                 content = StrUtil.isNotBlank(streamed) ? streamed : fallbackText;
                 // 非流式场景没有增量，块和增量都要一次性补发
                 resend = streamed.isEmpty() && StrUtil.isNotBlank(content);
                 if (resend) {
-                    appendTextBlock(TextChannel.ANSWER, content, false);
+                    appendTextBlock(TextKind.ANSWER, content, false);
                 }
             }
             if (resend) {
                 sender.sendEvent(AgentSSEEventType.MESSAGE.value(),
-                        new AgentMessageDelta(TextChannel.ANSWER.deltaType, content));
+                        new AgentMessageDelta(TextKind.ANSWER.kind, content));
             }
             String messageId = settleAndPersistMessage(content, AgentMessageStatus.NORMAL);
             sendTerminal(AgentSSEEventType.FINISH,
@@ -214,14 +216,14 @@ public class AgentStreamEventBridge {
             // 块和当场的增量都要发，只塞进 content 的话历史回放有块就不读 content，刷新后这句就没了
             String content;
             synchronized (stateLock) {
-                String streamed = textOf(TextChannel.ANSWER);
+                String streamed = textOf(TextKind.ANSWER);
                 content = StrUtil.isBlank(streamed)
                         ? NOTICE_INTERRUPTED
                         : streamed + "\n\n" + NOTICE_INTERRUPTED;
-                appendTextBlock(TextChannel.ERROR, NOTICE_INTERRUPTED, false);
+                appendTextBlock(TextKind.ERROR, NOTICE_INTERRUPTED, false);
             }
             sender.sendEvent(AgentSSEEventType.MESSAGE.value(),
-                    new AgentMessageDelta(TextChannel.ERROR.deltaType, NOTICE_INTERRUPTED));
+                    new AgentMessageDelta(TextKind.ERROR.kind, NOTICE_INTERRUPTED));
             // 出错也落库留痕，否则已执行的工具操作在历史里查不到
             String messageId = settleAndPersistMessage(content, AgentMessageStatus.INTERRUPTED);
             // finish 让前端把已流出的内容与工具块定型，口径与落库一致，刷新前后看到的是同一条
@@ -242,7 +244,7 @@ public class AgentStreamEventBridge {
             String content;
             boolean tracked;
             synchronized (stateLock) {
-                content = textOf(TextChannel.ANSWER);
+                content = textOf(TextKind.ANSWER);
                 // 有块就值得落库留痕
                 tracked = !blocks.isEmpty();
             }
@@ -255,14 +257,14 @@ public class AgentStreamEventBridge {
         });
     }
 
-    private void onTextDelta(TextChannel channel, String delta) {
+    private void onTextDelta(TextKind textKind, String delta) {
         if (StrUtil.isEmpty(delta)) {
             return;
         }
         synchronized (stateLock) {
-            appendTextBlock(channel, delta, true);
+            appendTextBlock(textKind, delta, true);
         }
-        sender.sendEvent(AgentSSEEventType.MESSAGE.value(), new AgentMessageDelta(channel.deltaType, delta));
+        sender.sendEvent(AgentSSEEventType.MESSAGE.value(), new AgentMessageDelta(textKind.kind, delta));
     }
 
     private void onAgentResult(Msg result) {
@@ -346,7 +348,7 @@ public class AgentStreamEventBridge {
                 return false;
             }
             pending = pendingConfirmCalls;
-            streamed = textOf(TextChannel.ANSWER);
+            streamed = textOf(TextKind.ANSWER);
         }
         String messageId = settleAndPersistMessage(streamed, AgentMessageStatus.AWAITING_CONFIRM);
         if (messageId == null) {
@@ -385,7 +387,7 @@ public class AgentStreamEventBridge {
             openToolBlocks.put(callKey(event.getToolCallId()), block);
             progress = AgentToolProgress.of(block);
         }
-        sender.sendEvent(AgentSSEEventType.TOOL.value(), progress);
+        sender.sendEvent(AgentSSEEventType.BLOCK.value(), progress);
     }
 
     /**
@@ -414,7 +416,7 @@ public class AgentStreamEventBridge {
             }
             progress = AgentToolProgress.of(block);
         }
-        sender.sendEvent(AgentSSEEventType.TOOL.value(), progress);
+        sender.sendEvent(AgentSSEEventType.BLOCK.value(), progress);
     }
 
     private void onToolResultDelta(ToolResultTextDeltaEvent event) {
@@ -455,7 +457,7 @@ public class AgentStreamEventBridge {
             applyExecutionTimes(block);
             progress = AgentToolProgress.of(block);
         }
-        sender.sendEvent(AgentSSEEventType.TOOL.value(), progress);
+        sender.sendEvent(AgentSSEEventType.BLOCK.value(), progress);
     }
 
     /**
@@ -475,7 +477,7 @@ public class AgentStreamEventBridge {
                 progresses.add(AgentToolProgress.of(block));
             }
         }
-        progresses.forEach(progress -> sender.sendEvent(AgentSSEEventType.TOOL.value(), progress));
+        progresses.forEach(progress -> sender.sendEvent(AgentSSEEventType.BLOCK.value(), progress));
     }
 
     /**
@@ -543,10 +545,10 @@ public class AgentStreamEventBridge {
      * 按块序拼回全文：封过口的块读正文，未封口的那块正文还没回填，读缓冲
      * 调用方需持 stateLock
      */
-    private String textOf(TextChannel channel) {
+    private String textOf(TextKind textKind) {
         StringBuilder text = new StringBuilder();
         for (AgentBlock block : blocks) {
-            if (!channel.kind.equals(block.getKind())) {
+            if (!textKind.kind.equals(block.getKind())) {
                 continue;
             }
             if (block == openTextBlock) {
@@ -562,11 +564,11 @@ public class AgentStreamEventBridge {
      * streamed=false 是一次性补发（非流式终答、中断提示），没有流的过程，不给起止
      * 调用方需持 stateLock
      */
-    private void appendTextBlock(TextChannel channel, String delta, boolean streamed) {
-        if (openTextBlock == null || !channel.kind.equals(openTextBlock.getKind())) {
+    private void appendTextBlock(TextKind textKind, String delta, boolean streamed) {
+        if (openTextBlock == null || !textKind.kind.equals(openTextBlock.getKind())) {
             sealOpenTextBlock();
             openTextBlock = AgentBlock.builder()
-                    .kind(channel.kind)
+                    .kind(textKind.kind)
                     .at(LocalDateTime.now(clock).format(BLOCK_TIME))
                     .startedAt(streamed ? facts.now() : null)
                     .build();
@@ -622,19 +624,21 @@ public class AgentStreamEventBridge {
     }
 
     /**
-     * 本轮块收口后落库：封口文本块、未完工具改 interrupted、补发封口帧，最后写库
+     * 本轮块收口后落库：封口文本块、未完工具按返回结果收口、补发封口帧与工具终态，最后写库
      * 调用方拿到 null 表示没写进去，此时不能再发带 messageId 的收尾事件
      */
     private String settleAndPersistMessage(String content, AgentMessageStatus status) {
         String thinking;
         List<AgentBlock> settled;
+        List<AgentToolProgress> returned = new ArrayList<>();
         // 思考文本与块列表在同一个锁内取快照
         synchronized (stateLock) {
-            thinking = textOf(TextChannel.REASONING);
-            settled = settleBlocks();
+            thinking = textOf(TextKind.REASONING);
+            settled = settleBlocks(returned);
         }
-        // 末段封口帧要赶在 finish/confirm/cancel 之前发出去
+        // 末段封口帧与补上的工具终态要赶在 finish/confirm/cancel 之前发出去，前端收到 cancel 后不再接块
         flushSealedTextBlocks();
+        returned.forEach(progress -> sender.sendEvent(AgentSSEEventType.BLOCK.value(), progress));
         try {
             return conversationService.addAssistantMessage(conversationId, userId, content,
                     thinking, settled, replyToMessageId, status, facts.settleRun());
@@ -645,9 +649,10 @@ public class AgentStreamEventBridge {
     }
 
     /**
-     * 调用方需持 stateLock：封口文本块、running 改 interrupted、剔除空文本块
+     * 调用方需持 stateLock：封口文本块、未完工具收口、剔除空文本块
+     * 没等到结束事件但工具体已返回的块放进 returned，由调用方出锁补发
      */
-    private List<AgentBlock> settleBlocks() {
+    private List<AgentBlock> settleBlocks(List<AgentToolProgress> returned) {
         sealOpenTextBlock();
         List<AgentBlock> settled = new ArrayList<>(blocks.size());
         for (AgentBlock block : blocks) {
@@ -657,10 +662,9 @@ public class AgentStreamEventBridge {
                 continue;
             }
             // 只判工具块，confirm 的 pending 由结算流程改写
-            if (AgentBlock.KIND_TOOL.equals(block.getKind()) && isOpen(block.getStatus())) {
-                block.setStatus(AgentToolStatus.INTERRUPTED.value());
-                // 可能已进过工具体，补上真实起点
-                applyExecutionTimes(block);
+            if (AgentBlock.KIND_TOOL.equals(block.getKind()) && isOpen(block.getStatus())
+                    && settleOpenToolBlock(block)) {
+                returned.add(AgentToolProgress.of(block));
             }
             settled.add(block);
         }
@@ -668,27 +672,45 @@ public class AgentStreamEventBridge {
     }
 
     /**
-     * 文本通道：协议增量类型与块 kind 一一对应，两套名字只在这里搭一次
+     * 框架整批回来才发结束事件，同批有工具没回来就被停止时，已返回的那条按它自己的结果收口，没返回的判 interrupted
+     * 返回 true 表示按返回结果收口；调用方需持 stateLock
+     */
+    private boolean settleOpenToolBlock(AgentBlock block) {
+        // 可能已进过工具体，补上真实起止
+        applyExecutionTimes(block);
+        ToolResultBlock result = facts.toolFact(block.getToolCallId()).result();
+        if (result == null) {
+            block.setStatus(AgentToolStatus.INTERRUPTED.value());
+            return false;
+        }
+        block.setStatus(AgentToolStatus.of(result.getState()).value());
+        block.setResult(resultTextOf(result));
+        return true;
+    }
+
+    /**
+     * 拼法与截断同结果增量：框架按文本块逐个发增量，中间不加分隔
+     */
+    private static String resultTextOf(ToolResultBlock result) {
+        String text = result.getOutput().stream()
+                .filter(TextBlock.class::isInstance)
+                .map(block -> StrUtil.emptyIfNull(((TextBlock) block).getText()))
+                .collect(Collectors.joining());
+        return StrUtil.emptyToNull(StrUtil.sub(text, 0, TOOL_RESULT_MAX_CHARS));
+    }
+
+    /**
+     * 文本类型：增量与块共用，限定为回答、思考和中断提示
      */
     @AllArgsConstructor
-    private enum TextChannel {
+    private enum TextKind {
 
-        ANSWER("response", AgentBlock.KIND_ANSWER),
-
-        REASONING("think", AgentBlock.KIND_REASONING),
-
-        /**
-         * 中断提示单开一路，与模型说的话区分开
-         */
-        ERROR("error", AgentBlock.KIND_ERROR);
+        ANSWER(AgentBlock.KIND_ANSWER),
+        REASONING(AgentBlock.KIND_REASONING),
+        ERROR(AgentBlock.KIND_ERROR);
 
         /**
-         * 发给前端的增量类型
-         */
-        private final String deltaType;
-
-        /**
-         * 落库的块 kind
+         * 发给前端的增量 type 与落库的块 kind 共用的值
          */
         private final String kind;
     }
