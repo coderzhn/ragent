@@ -2,16 +2,15 @@ server:
   port: 9090
   servlet:
     context-path: /api/ragent
-
 spring:
   application:
     name: ragent${unique-name:}-service
-
   servlet:
     multipart:
       max-file-size: 50MB
       max-request-size: 100MB
-
+  profiles:
+    active: local
   datasource:
     driver-class-name: org.postgresql.Driver
     type: com.zaxxer.hikari.HikariDataSource

@@ -44,5 +44,9 @@
       "Read(//usr/local/bin/**)",
       "Skill(deep-research)"
     ]
-  }
+  },
+  "disabledMcpjsonServers": [
+    "excel",
+    "pptx"
+  ]
 }

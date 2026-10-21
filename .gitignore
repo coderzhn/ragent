@@ -3,7 +3,7 @@ temp
 .mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
-
+bootstrap/src/main/resources/application-local.yaml
 ### STS ###
 .apt_generated
 .classpath
