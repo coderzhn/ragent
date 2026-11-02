@@ -17,20 +17,12 @@
 
 package com.nageoffer.ai.ragent.agent.memory;
 
-import com.nageoffer.ai.ragent.agent.enums.AgentMemorySourceType;
-
 import java.util.List;
 
 /**
- * 一次提交的全部入参：快照期取到的凭证连同 Judge 决策一起交给提交侧复核
- * merges 只在容量顶到上限那次非空，与决策在同一事务里落地
+ * 一次 Judge 调用的结论：要怎样改记忆，以及为什么这样改或不改；空决策即合法的不改
+ * 只由解析处在校验通过后构造；下游只读这份原始结论，Edit 另生成执行计划，所以不额外做不可修改拷贝
+ * 说明不代表已经保存，保存与否以提交结果为准
  */
-public record AgentMemoryCommit(String userId,
-                                String extractionId,
-                                int attemptCount,
-                                long expectedRevision,
-                                String expectedWatermark,
-                                AgentMemorySourceType sourceType,
-                                List<AgentMemoryDecision> decisions,
-                                List<AgentMemoryMerge> merges) {
+public record AgentMemoryJudgement(List<AgentMemoryDecision> decisions, String explanation) {
 }

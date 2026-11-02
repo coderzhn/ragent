@@ -24,10 +24,8 @@ import com.nageoffer.ai.ragent.agent.config.ReActAgentProvider;
 import com.nageoffer.ai.ragent.agent.config.ReActAgentProvider.ActiveAgent;
 import com.nageoffer.ai.ragent.agent.dto.AgentConfirmSettlement;
 import com.nageoffer.ai.ragent.agent.dto.AgentMetaPayload;
-import com.nageoffer.ai.ragent.agent.enums.AgentMemoryTriggerType;
 import com.nageoffer.ai.ragent.agent.enums.AgentSSEEventType;
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryPipeline;
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryProperties;
+import com.nageoffer.ai.ragent.agent.memory.AgentMemoryLearner;
 import com.nageoffer.ai.ragent.agent.service.AgentChatService;
 import com.nageoffer.ai.ragent.agent.service.AgentConversationService;
 import com.nageoffer.ai.ragent.agent.service.handler.AgentRunGate;
@@ -78,8 +76,7 @@ public class AgentChatServiceImpl implements AgentChatService {
     private final AgentConversationService conversationService;
     private final StreamTaskManager taskManager;
     private final AgentRunGate runGate;
-    private final AgentMemoryProperties memoryProperties;
-    private final AgentMemoryPipeline memoryPipeline;
+    private final AgentMemoryLearner memoryLearner;
 
     @Override
     public void streamChat(String question, String conversationId, SseEmitter emitter) {
@@ -142,8 +139,8 @@ public class AgentChatServiceImpl implements AgentChatService {
         ActiveAgent activeAgent = agentProvider.getAgent();
 
         String title = conversationService.touchConversation(conversationId, userId, question);
-        // 必须在 addUserMessage 之前建立基线，否则本轮消息会被划进历史、漏抽
-        memoryPipeline.ensureExtractionBaseline(userId);
+        // 必须先于本轮发言入库：首次纳入长期记忆时后台游标停在已有发言上，本轮发言才不会被划进历史
+        memoryLearner.ensureCursor(userId);
         String questionMessageId = conversationService.addUserMessage(conversationId, userId, question);
 
         launchStream(new UserMessage(question), activeAgent, RunScope.builder()
@@ -341,24 +338,14 @@ public class AgentChatServiceImpl implements AgentChatService {
     }
 
     /**
-     * 轮次结束后异步抽取长期记忆
+     * 轮次结束后异步尝试一次后台学习，按用户累计够门槛才真正调模型
      */
     private void scheduleMemoryExtraction(String userId, String conversationId) {
-        if (!memoryProperties.isLongTermEnabled()) {
-            return;
-        }
-        Mono.fromCallable(() -> memoryPipeline.extract(userId, conversationId, AgentMemoryTriggerType.BACKGROUND))
+        // 结果日志在 AgentMemoryLearner 里打；用户已拿到答复，这里只记意外异常
+        Mono.fromCallable(() -> memoryLearner.learn(userId))
                 .subscribeOn(Schedulers.boundedElastic())
                 .subscribe(outcome -> {
-                            if (outcome.idle()) {
-                                return;
-                            }
-                            log.info("轮次结束后台记忆抽取完成, userId: {}, conversationId: {}, 状态: {}, 落库: {}",
-                                    userId, conversationId, outcome.status(), outcome.applied());
-                        },
-                        // 用户已拿到答复，失败只记日志
-                        e -> log.error("轮次结束后台记忆抽取异常, userId: {}, conversationId: {}",
-                                userId, conversationId, e));
+                }, e -> log.error("轮次结束后台记忆抽取异常, userId: {}, conversationId: {}", userId, conversationId, e));
     }
 
     /**

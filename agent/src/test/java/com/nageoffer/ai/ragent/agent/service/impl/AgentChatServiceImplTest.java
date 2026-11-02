@@ -20,10 +20,8 @@ package com.nageoffer.ai.ragent.agent.service.impl;
 import com.nageoffer.ai.ragent.agent.config.ReActAgentProvider;
 import com.nageoffer.ai.ragent.agent.config.ReActAgentProvider.ActiveAgent;
 import com.nageoffer.ai.ragent.agent.dto.AgentConfirmSettlement;
-import com.nageoffer.ai.ragent.agent.enums.AgentMemoryTriggerType;
 import com.nageoffer.ai.ragent.agent.memory.AgentMemoryOutcome;
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryPipeline;
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryProperties;
+import com.nageoffer.ai.ragent.agent.memory.AgentMemoryLearner;
 import com.nageoffer.ai.ragent.agent.service.AgentConversationService;
 import com.nageoffer.ai.ragent.agent.service.handler.AgentRunGate;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolCatalog.ResolvedCatalog;
@@ -89,7 +87,6 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
-import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 class AgentChatServiceImplTest {
@@ -101,8 +98,7 @@ class AgentChatServiceImplTest {
     private AgentConversationService conversationService;
     private StreamTaskManager taskManager;
     private AgentRunGate runGate;
-    private AgentMemoryProperties memoryProperties;
-    private AgentMemoryPipeline memoryPipeline;
+    private AgentMemoryLearner memoryLearner;
     private AtomicInteger gateReleased;
     private ReActAgent agent;
     private AgentChatServiceImpl service;
@@ -114,11 +110,8 @@ class AgentChatServiceImplTest {
         taskManager = mock(StreamTaskManager.class);
         runGate = mock(AgentRunGate.class);
         agent = mock(ReActAgent.class);
-        memoryProperties = new AgentMemoryProperties();
-        memoryProperties.setLongTermEnabled(false);
-        memoryPipeline = mock(AgentMemoryPipeline.class);
-        service = new AgentChatServiceImpl(agentProvider, conversationService, taskManager, runGate,
-                memoryProperties, memoryPipeline);
+        memoryLearner = mock(AgentMemoryLearner.class);
+        service = new AgentChatServiceImpl(agentProvider, conversationService, taskManager, runGate, memoryLearner);
 
         gateReleased = new AtomicInteger();
         when(runGate.acquire(anyString(), anyString(), anyString())).thenReturn(gateReleased::incrementAndGet);
@@ -128,8 +121,8 @@ class AgentChatServiceImplTest {
                 .thenReturn("会话标题");
         when(conversationService.addUserMessage(anyString(), anyString(), anyString())).thenReturn("m-3003");
         // 每轮收尾都会调一次，不给默认结局其余用例会在后台线程上吃 NPE
-        when(memoryPipeline.extract(anyString(), anyString(), any(AgentMemoryTriggerType.class)))
-                .thenReturn(new AgentMemoryOutcome(AgentMemoryOutcome.Status.BELOW_THRESHOLD, 0, 1, false));
+        when(memoryLearner.learn(anyString()))
+                .thenReturn(AgentMemoryOutcome.of(AgentMemoryOutcome.Status.BELOW_THRESHOLD));
         UserContext.set(LoginUser.builder().userId(USER_ID).username("tester").build());
     }
 
@@ -181,7 +174,7 @@ class AgentChatServiceImplTest {
         verify(conversationService, never()).touchConversation(anyString(), anyString(), anyString());
         verify(conversationService, never()).addUserMessage(anyString(), anyString(), anyString());
         verify(taskManager, never()).register(anyString(), anyString(), any());
-        verifyNoInteractions(agentProvider, agent, memoryPipeline);
+        verifyNoInteractions(agentProvider, agent, memoryLearner);
         assertThat(gateReleased.get()).isOne();
     }
 
@@ -212,20 +205,19 @@ class AgentChatServiceImplTest {
     }
 
     /**
-     * 轮次收尾触发抽取，且必须离开请求线程
+     * 轮次收尾触发后台整理，且必须离开请求线程
      */
     @Test
     void shouldTriggerBackgroundExtractionOffTheRequestThread() throws Exception {
-        memoryProperties.setLongTermEnabled(true);
         CountDownLatch extracted = new CountDownLatch(1);
         AtomicReference<Thread> extractThread = new AtomicReference<>();
         AtomicInteger releasedWhenExtracting = new AtomicInteger(-1);
-        when(memoryPipeline.extract(USER_ID, CONVERSATION_ID, AgentMemoryTriggerType.BACKGROUND))
+        when(memoryLearner.learn(USER_ID))
                 .thenAnswer(invocation -> {
                     extractThread.set(Thread.currentThread());
                     releasedWhenExtracting.set(gateReleased.get());
                     extracted.countDown();
-                    return new AgentMemoryOutcome(AgentMemoryOutcome.Status.WRITTEN, 1, 3, true);
+                    return new AgentMemoryOutcome(AgentMemoryOutcome.Status.COMMITTED, List.of("新增：用户住在杭州"), "");
                 });
         when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
 
@@ -237,32 +229,17 @@ class AgentChatServiceImplTest {
     }
 
     /**
-     * 控制行建行时刻是抽取下界，必须先于本轮消息落库：反过来首条消息成「历史」，永久漏出抽取范围
+     * 游标界线由入口决定：建游标必须先于本轮发言入库，反过来首条发言会被划进接入前的历史
      */
     @Test
-    void shouldEnsureBaselineBeforeSavingUserMessage() {
-        memoryProperties.setLongTermEnabled(true);
+    void shouldEnsureCursorBeforeSavingUserMessage() {
         when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
 
-        service.streamChat("我对花生严重过敏", CONVERSATION_ID, new SseEmitter());
+        service.streamChat("我一直戴眼镜", CONVERSATION_ID, new SseEmitter());
 
-        InOrder inOrder = inOrder(memoryPipeline, conversationService);
-        inOrder.verify(memoryPipeline).ensureExtractionBaseline(USER_ID);
-        inOrder.verify(conversationService).addUserMessage(CONVERSATION_ID, USER_ID, "我对花生严重过敏");
-    }
-
-    /**
-     * 关掉开关连异步线程都不该起
-     */
-    @Test
-    void shouldSkipBackgroundExtractionWhenLongTermDisabled() {
-        memoryProperties.setLongTermEnabled(false);
-        when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class))).thenReturn(Flux.empty());
-
-        service.streamChat("问题", CONVERSATION_ID, new SseEmitter());
-
-        verify(memoryPipeline).ensureExtractionBaseline(USER_ID);
-        verifyNoMoreInteractions(memoryPipeline);
+        InOrder inOrder = inOrder(memoryLearner, conversationService);
+        inOrder.verify(memoryLearner).ensureCursor(USER_ID);
+        inOrder.verify(conversationService).addUserMessage(CONVERSATION_ID, USER_ID, "我一直戴眼镜");
     }
 
     /**
@@ -591,7 +568,6 @@ class AgentChatServiceImplTest {
 
     @Test
     void shouldUnregisterTaskWhenStartupFails() {
-        memoryProperties.setLongTermEnabled(true);
         when(agent.streamEvents(any(Msg.class), any(RuntimeContext.class)))
                 .thenThrow(new IllegalStateException("上游没起来"));
 
@@ -602,7 +578,7 @@ class AgentChatServiceImplTest {
         verify(taskManager).unregister(anyString());
         verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
         verify(agent, never()).saveAgentState(anyString(), anyString());
-        verify(memoryPipeline, never()).extract(anyString(), anyString(), any());
+        verify(memoryLearner, never()).learn(anyString());
         assertThat(gateReleased.get()).isOne();
     }
 
@@ -639,7 +615,6 @@ class AgentChatServiceImplTest {
     @Test
     void shouldKeepConfirmPendingWhenRegistrationFails() {
         prepareConfirmation();
-        memoryProperties.setLongTermEnabled(true);
         IllegalStateException failure = new IllegalStateException("Redis 写入失败");
         doThrow(failure).when(taskManager).register(anyString(), anyString(), any());
 
@@ -648,7 +623,7 @@ class AgentChatServiceImplTest {
         verify(conversationService, never()).settlePendingConfirm(anyString(), anyString(), anyString(), anyBoolean());
         verify(agent).clearStateCache(USER_ID, CONVERSATION_ID);
         verify(agent, never()).saveAgentState(anyString(), anyString());
-        verifyNoInteractions(memoryPipeline);
+        verifyNoInteractions(memoryLearner);
         assertThat(gateReleased.get()).isOne();
     }
 

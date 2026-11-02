@@ -17,7 +17,7 @@
 
 package com.nageoffer.ai.ragent.agent.tool;
 
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryPipeline;
+import com.nageoffer.ai.ragent.agent.memory.AgentMemoryFlusher;
 import com.nageoffer.ai.ragent.agent.memory.AgentMemoryProperties;
 import com.nageoffer.ai.ragent.agent.tool.AgentMcpClients.RemoteTool;
 import com.nageoffer.ai.ragent.agent.tool.AgentToolCatalog.McpToolBinding;
@@ -66,7 +66,7 @@ class AgentToolCatalogTest {
                 intentNodeRegistry,
                 mcpClients,
                 memoryProperties(false),
-                mock(AgentMemoryPipeline.class),
+                mock(AgentMemoryFlusher.class),
                 mock(AgentSkillRegistry.class));
 
         AgentToolCatalog.ResolvedCatalog resolved = catalog.resolve(KNOWLEDGE_ONLY);
@@ -309,7 +309,7 @@ class AgentToolCatalogTest {
                 intentNodeRegistry,
                 mcpClients,
                 memoryProperties(false),
-                mock(AgentMemoryPipeline.class),
+                mock(AgentMemoryFlusher.class),
                 mock(AgentSkillRegistry.class));
     }
 
@@ -326,7 +326,7 @@ class AgentToolCatalogTest {
                 intentNodeRegistry,
                 mcpClients,
                 memoryProperties(longTermEnabled),
-                mock(AgentMemoryPipeline.class),
+                mock(AgentMemoryFlusher.class),
                 mock(AgentSkillRegistry.class));
     }
 

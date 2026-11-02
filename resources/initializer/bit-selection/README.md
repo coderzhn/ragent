@@ -96,7 +96,7 @@ diff <(ls docs/knowledge/product/detail/*.md | xargs -n1 basename | sed 's|\.md$
 | `AGENT_MEMORY_EXTRACTION` | agent | 规则与内置一致，「什么该记、什么不该记」的例子换成售后排查、维修进度、比较中的商品 |
 | `AGENT_CONTEXT_COMPACTION` | agent | 按商城的事整理：一副耳机、一笔订单、一款在考虑的商品各占一条；价格库存只记查过不抄数值；分清用户自述、工具查得、助手判断 |
 
-`CONVERSATION_SUMMARY` 与 `SYSTEM_CHAT` 在 `agent` 档下没有调用方，填它们是为了这套数据集切到 `workflow` 档也不自报企业助手。`AGENT_MEMORY_EXTRACTION` 与 `AGENT_CONTEXT_COMPACTION` 都是整份覆盖，内置那份改了通用规则（围栏、原话保留、暂缓与放弃的写法）要同步过来。上下文压缩单独填，是因为内置那份按通用办事写，在商城会话里会把每次追问记成一条「了解 X」、把价格库存逐个抄进摘要，摘要随轮数越续越长。剩下的知识与记忆工具声明、长期记忆合并本就与领域无关，填了反而要跟着内置那份一起维护。
+`CONVERSATION_SUMMARY` 与 `SYSTEM_CHAT` 在 `agent` 档下没有调用方，填它们是为了这套数据集切到 `workflow` 档也不自报企业助手。`AGENT_MEMORY_EXTRACTION` 与 `AGENT_CONTEXT_COMPACTION` 都是整份覆盖，内置那份改了通用规则（围栏、原话保留、暂缓与放弃的写法）要同步过来。上下文压缩单独填，是因为内置那份按通用办事写，在商城会话里会把每次追问记成一条「了解 X」、把价格库存逐个抄进摘要，摘要随轮数越续越长。剩下的知识与记忆工具声明本就与领域无关，填了反而要跟着内置那份一起维护。
 
 ## 五、示例问题的选题口径
 

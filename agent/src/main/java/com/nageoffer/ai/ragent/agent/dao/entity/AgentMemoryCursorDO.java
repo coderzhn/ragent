@@ -15,37 +15,26 @@
  * limitations under the License.
  */
 
-package com.nageoffer.ai.ragent.agent.enums;
+package com.nageoffer.ai.ragent.agent.dao.entity;
+
+import lombok.Data;
+
+import java.util.Date;
 
 /**
- * 长期记忆抽取任务的处理状态
- * WRITTEN、NOOP 和 DROPPED 表示本批消息已处理，后续抽取会跳过这些消息
+ * 每用户一行的长期记忆游标，读写全走注解 Mapper（要 ON CONFLICT 与条件推进）
  */
-public enum AgentMemoryExtractionStatus {
+@Data
+public class AgentMemoryCursorDO {
+
+    private String userId;
 
     /**
-     * 正在处理，同一用户同时只能有一个抽取任务处于此状态
+     * 已整理到的最后一条用户发言ID，之后的用户发言都待整理；为空表示从该用户第一条发言开始
      */
-    PROCESSING,
+    private String lastMessageId;
 
-    /**
-     * 处理完成，已执行本批次的记忆变更
-     */
-    WRITTEN,
+    private Date createTime;
 
-    /**
-     * 处理完成，本批次没有生效的记忆决策
-     */
-    NOOP,
-
-    /**
-     * 处理失败且已达到最大尝试次数，跳过本批消息，继续处理后续消息
-     */
-    DROPPED,
-
-    /**
-     * 本次处理未完成，等待重试，包括提交时数据已变化、处理失败或超时
-     * 其中，提交时数据已变化的情况不计入尝试次数
-     */
-    CONFLICT
+    private Date updateTime;
 }

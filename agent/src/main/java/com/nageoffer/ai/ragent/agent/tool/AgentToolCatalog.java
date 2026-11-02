@@ -19,7 +19,7 @@ package com.nageoffer.ai.ragent.agent.tool;
 
 import cn.hutool.core.util.StrUtil;
 import com.nageoffer.ai.ragent.agent.config.ConditionalOnAgentEngine;
-import com.nageoffer.ai.ragent.agent.memory.AgentMemoryPipeline;
+import com.nageoffer.ai.ragent.agent.memory.AgentMemoryFlusher;
 import com.nageoffer.ai.ragent.agent.memory.AgentMemoryProperties;
 import com.nageoffer.ai.ragent.agent.skill.SkillLoadTool;
 import com.nageoffer.ai.ragent.agent.tool.AgentMcpClients.RemoteTool;
@@ -65,7 +65,7 @@ public class AgentToolCatalog {
     private final IntentNodeRegistry intentNodeRegistry;
     private final AgentMcpClients mcpClients;
     private final AgentMemoryProperties memoryProperties;
-    private final AgentMemoryPipeline memoryPipeline;
+    private final AgentMemoryFlusher memoryFlusher;
     private final AgentSkillRegistry skillRegistry;
 
     /**
@@ -88,7 +88,7 @@ public class AgentToolCatalog {
         toolkit.registerAgentTool(new KnowledgeSearchTool(
                 catalog.knowledgeToolDescription, knowledgeSearchFacade));
         if (catalog.memoryToolDescription != null) {
-            toolkit.registerAgentTool(new MemoryFlushTool(catalog.memoryToolDescription, memoryPipeline));
+            toolkit.registerAgentTool(new MemoryFlushTool(catalog.memoryToolDescription, memoryFlusher));
         } else if (memoryProperties.isLongTermEnabled()) {
             log.warn("AGENT_MEMORY_TOOL_DESCRIPTION 提示词为空, 本次不挂载 {}", MemoryFlushTool.TOOL_NAME);
         }
